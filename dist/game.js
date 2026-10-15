@@ -1,0 +1,3413 @@
+/* Independently written browser application and tooling:
+MIT License
+
+Copyright (c) 2026 lode.ai contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+CPU6502 license:
+The MIT License (MIT)
+
+Copyright (c) 2010-2021 Will Scullin and contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+License scope:
+# License scope
+
+This repository contains separately licensed components. The root MIT license
+applies to the independently written browser application and tooling listed
+below. It does **not** relicense the original game or the reverse engineering.
+
+| Material | Terms |
+| --- | --- |
+| `src/app.js`, `src/machine.js`, `src/index.html`, `src/style.css` | MIT; newly written browser adapters and interface |
+| `scripts/*.mjs`, `tests/browser.mjs`, `tests/mechanics.mjs` | MIT; newly written build and verification code |
+| Root project documentation and configuration | MIT, excluding quoted third-party notices and the supplied research document |
+| `vendor/cpu6502-runtime/` | Upstream MIT, copyright Will Scullin and contributors; its full license is retained |
+| `research/main.asm`, `research/main.nw`, `research/track_*.asm` | Upstream reconstruction under CC BY-SA 4.0, subject to underlying original-game rights; see THIRD-PARTY.md |
+| `research/main.bin`, `src/data.js`, original maps, sprites, game code and audio sequences | Original game material; **not covered by the project's MIT grant**. Extraction or encoding does not change its rights |
+| `dist/*.html`, `dist/game.js`, `tests/machine.mjs`, distribution ZIP | Combined artifacts: retain the component-specific terms above; **not MIT-only** |
+| Gameplay screenshots | Contain original game artwork; not covered by the project's MIT grant |
+| `lode-runner-codex-research-prompt.md` | User-supplied reference, not relicensed by this project |
+
+The independently written CPU/device adapters execute the original program;
+they do not translate or replace its gameplay routines. The binary remains
+unchanged. The extraction tool repackages upstream sector bytes. Any adaptation
+of the CC BY-SA reconstruction remains under CC BY-SA 4.0; the MIT grant does
+not override its ShareAlike obligations.
+
+This is an unofficial preservation project. The availability of an upstream
+reconstruction is not a claim that original commercial game assets have been
+released under an open-source license. No trademark rights are granted.
+
+See [THIRD-PARTY.md](THIRD-PARTY.md) for pinned sources, attribution, changes,
+hashes, and the upstream [CC BY-SA 4.0 terms](https://creativecommons.org/licenses/by-sa/4.0/).
+
+Apple II reconstruction: Robert Baruch / XekriRedmane, CC BY-SA 4.0, https://github.com/XekriRedmane/lode_runner_reveng . Changes: binary embedded unchanged; level sectors repackaged as a browser array. https://creativecommons.org/licenses/by-sa/4.0/ . Original game copyright Doug Smith / Broderbund; original assets retain their rights. This combined file is not MIT-only. */
+(() => {
+  // vendor/cpu6502-runtime/js/util.ts
+  var hex_digits = "0123456789ABCDEF";
+  function toHex(v, n) {
+    if (!n) {
+      n = v < 256 ? 2 : 4;
+    }
+    let result = "";
+    for (let idx = 0; idx < n; idx++) {
+      result = hex_digits[v & 15] + result;
+      v >>= 4;
+    }
+    return result;
+  }
+
+  // vendor/cpu6502-runtime/js/cpu6502.ts
+  var FLAVOR_6502 = "6502";
+  var FLAVOR_ROCKWELL_65C02 = "rockwell65c02";
+  var FLAVOR_WDC_65C02 = "wdc65c02";
+  var FLAVORS_65C02 = [FLAVOR_ROCKWELL_65C02, FLAVOR_WDC_65C02];
+  var FLAVORS = [FLAVOR_6502, ...FLAVORS_65C02];
+  var sizes = {
+    accumulator: 1,
+    implied: 1,
+    immediate: 2,
+    absolute: 3,
+    zeroPage: 2,
+    relative: 2,
+    absoluteX: 3,
+    absoluteY: 3,
+    zeroPageX: 2,
+    zeroPageY: 2,
+    absoluteIndirect: 3,
+    zeroPageXIndirect: 2,
+    zeroPageIndirectY: 2,
+    /* 65c02 */
+    zeroPageIndirect: 2,
+    absoluteXIndirect: 3,
+    zeroPage_relative: 3
+  };
+  var flags = {
+    N: 128,
+    // Negative
+    V: 64,
+    // oVerflow
+    X: 32,
+    // Unused, always 1
+    B: 16,
+    // Break
+    D: 8,
+    // Decimal
+    I: 4,
+    // Interrupt
+    Z: 2,
+    // Zero
+    C: 1
+    // Carry
+  };
+  var loc = {
+    STACK: 256,
+    NMI: 65530,
+    RESET: 65532,
+    BRK: 65534
+  };
+  function isResettablePageHandler(pageHandler) {
+    return pageHandler.reset !== void 0;
+  }
+  var BLANK_PAGE = {
+    read: function() {
+      return 0;
+    },
+    write: function() {
+    }
+  };
+  var CPU6502 = class {
+    /** flavor */
+    flavor;
+    /** 65C02 emulation mode flag */
+    is65C02;
+    /**
+     * Registers
+     */
+    /** Program counter */
+    pc = 0;
+    /** Status register */
+    sr = flags.X;
+    /** Accumulator */
+    ar = 0;
+    /** X index */
+    xr = 0;
+    /** Y index */
+    yr = 0;
+    /** Stack pointer */
+    sp = 255;
+    /** Current instruction */
+    op;
+    /** Last accessed memory address */
+    addr = 0;
+    /** Filled array of memory handlers by address page */
+    memPages = new Array(256);
+    /** Callbacks invoked on reset signal */
+    resetHandlers = [];
+    /** Elapsed cycles */
+    cycles = 0;
+    /** Command being fetched signal */
+    sync = false;
+    /** Processor is in WAI mode */
+    wait = false;
+    /** Processor is in STP mode */
+    stop = false;
+    /** Filled array of CPU operations */
+    opary;
+    /**
+     * Constructor for all versions.
+     *
+     * @param flavor One of several supported CPU flavors, either
+     * `FLAVOR_6502` (the default), the original MOS 6502;
+     * `FLAVOR_ROCKWELL_65C02`, a Rockwell manufactured 65C02;
+     * or `FLAVOR_WDC_65C02`, a WDC manufactured 65C02.
+     */
+    constructor({ flavor } = {}) {
+      this.flavor = flavor ?? FLAVOR_6502;
+      this.is65C02 = !!flavor && FLAVORS_65C02.includes(flavor);
+      this.memPages.fill(BLANK_PAGE);
+      this.memPages.fill(BLANK_PAGE);
+      let ops = { ...this.OPS_6502 };
+      switch (this.flavor) {
+        case FLAVOR_WDC_65C02:
+          ops = {
+            ...ops,
+            ...this.OPS_65C02,
+            ...this.OPS_WDC_65C02
+          };
+          break;
+        case FLAVOR_ROCKWELL_65C02:
+          ops = {
+            ...ops,
+            ...this.OPS_65C02,
+            ...this.OPS_ROCKWELL_65C02
+          };
+          break;
+        default:
+          ops = {
+            ...ops,
+            ...this.OPS_NMOS_6502
+          };
+      }
+      this.opary = new Array(256);
+      for (let idx = 0; idx < 256; idx++) {
+        this.opary[idx] = ops[idx] || this.unknown(idx);
+      }
+    }
+    /**
+     * Set or clears `f` in the status register. `f` must be a byte with a
+     * single bit set.
+     */
+    setFlag(f, on) {
+      this.sr = on ? this.sr | f : this.sr & ~f;
+    }
+    /** Updates the status register's zero flag and negative flag. */
+    testNZ(val) {
+      this.sr = val === 0 ? this.sr | flags.Z : this.sr & ~flags.Z;
+      this.sr = val & 128 ? this.sr | flags.N : this.sr & ~flags.N;
+      return val;
+    }
+    /** Updates the status register's zero flag. */
+    testZ(val) {
+      this.sr = val === 0 ? this.sr | flags.Z : this.sr & ~flags.Z;
+      return val;
+    }
+    /**
+     * Returns `a + b`, unless `sub` is true, in which case it performs
+     * `a - b`. The status register is updated according to the result.
+     */
+    add(a, b, sub) {
+      const a7 = a >> 7;
+      const b7 = b >> 7;
+      const ci = this.sr & flags.C;
+      let c;
+      let co;
+      let v;
+      let n;
+      let z;
+      const updateFlags = (c2) => {
+        const bin = c2 & 255;
+        n = bin >> 7;
+        co = c2 >> 8;
+        z = !(a + b + ci & 255);
+        v = a7 ^ b7 ^ n ^ co;
+      };
+      const updateBCDFlags = (c2) => {
+        if (this.is65C02) {
+          const bin = c2 & 255;
+          n = bin >> 7;
+          z = !bin;
+          if (this.op?.mode === "immediate") {
+            if (this.flavor === FLAVOR_WDC_65C02) {
+              this.readByte(sub ? 184 : 127);
+            } else {
+              this.readByte(sub ? 177 : 89);
+            }
+          } else {
+            this.readByte(this.addr);
+          }
+        }
+        if (!sub) {
+          co = c2 >> 8;
+        }
+      };
+      c = (a & 15) + (b & 15) + ci;
+      if ((this.sr & flags.D) !== 0) {
+        if (sub) {
+          if (c < 16) {
+            c = c - 6 & 15;
+          }
+          c += (a & 240) + (b & 240);
+          updateFlags(c);
+          if (c < 256) {
+            c += 160;
+          }
+        } else {
+          if (c > 9) {
+            c = 16 + (c + 6 & 15);
+          }
+          c += (a & 240) + (b & 240);
+          updateFlags(c);
+          if (c >= 160) {
+            c += 96;
+          }
+        }
+        updateBCDFlags(c);
+      } else {
+        c += (a & 240) + (b & 240);
+        updateFlags(c);
+      }
+      c = c & 255;
+      this.setFlag(flags.N, !!n);
+      this.setFlag(flags.V, !!v);
+      this.setFlag(flags.Z, !!z);
+      this.setFlag(flags.C, !!co);
+      return c;
+    }
+    /** Increments `a` and returns the value, setting the status register. */
+    increment(a) {
+      return this.testNZ(a + 1 & 255);
+    }
+    decrement(a) {
+      return this.testNZ(a + 255 & 255);
+    }
+    readBytePC() {
+      const result = this.readByte(this.pc);
+      this.pc = this.pc + 1 & 65535;
+      return result;
+    }
+    readByte(addr) {
+      this.addr = addr;
+      const page = addr >> 8, off = addr & 255;
+      const result = this.memPages[page].read(page, off);
+      this.cycles++;
+      return result;
+    }
+    writeByte(addr, val) {
+      this.addr = addr;
+      const page = addr >> 8, off = addr & 255;
+      this.memPages[page].write(page, off, val);
+      this.cycles++;
+    }
+    readWord(addr) {
+      return this.readByte(addr) | this.readByte(addr + 1) << 8;
+    }
+    readWordPC() {
+      return this.readBytePC() | this.readBytePC() << 8;
+    }
+    readZPWord(addr) {
+      const lsb = this.readByte(addr & 255);
+      const msb = this.readByte(addr + 1 & 255);
+      return msb << 8 | lsb;
+    }
+    pushByte(val) {
+      this.writeByte(loc.STACK | this.sp, val);
+      this.sp = this.sp + 255 & 255;
+    }
+    pushWord(val) {
+      this.pushByte(val >> 8);
+      this.pushByte(val & 255);
+    }
+    pullByte() {
+      this.sp = this.sp + 1 & 255;
+      return this.readByte(loc.STACK | this.sp);
+    }
+    pullWordRaw() {
+      const lsb = this.pullByte();
+      const msb = this.pullByte();
+      return msb << 8 | lsb;
+    }
+    // Helpers that replicate false reads and writes during work cycles that
+    // vary between CPU versions
+    workCycle(addr, val) {
+      if (this.is65C02) {
+        this.readByte(addr);
+      } else {
+        this.writeByte(addr, val);
+      }
+    }
+    workCycleIndexedWrite(pc, addr, addrIdx) {
+      const oldPage = addr & 65280;
+      if (this.is65C02) {
+        this.readByte(pc);
+      } else {
+        const off = addrIdx & 255;
+        this.readByte(oldPage | off);
+      }
+    }
+    workCycleIndexedRead(pc, addr, addrIdx) {
+      const oldPage = addr & 65280;
+      const newPage = addrIdx & 65280;
+      if (newPage !== oldPage) {
+        if (this.is65C02) {
+          this.readByte(pc);
+        } else {
+          const off = addrIdx & 255;
+          this.readByte(oldPage | off);
+        }
+      }
+    }
+    /*
+     * Implied function
+     */
+    implied = () => {
+      this.readByte(this.pc);
+    };
+    /*
+     * Read functions
+     */
+    // #$00
+    readImmediate = () => {
+      return this.readBytePC();
+    };
+    // $0000
+    readAbsolute = () => {
+      return this.readByte(this.readWordPC());
+    };
+    // $00
+    readZeroPage = () => {
+      return this.readByte(this.readBytePC());
+    };
+    // $0000,X
+    readAbsoluteX = () => {
+      const addr = this.readWordPC();
+      const pc = this.addr;
+      const addrIdx = addr + this.xr & 65535;
+      this.workCycleIndexedRead(pc, addr, addrIdx);
+      return this.readByte(addrIdx);
+    };
+    // $0000,Y
+    readAbsoluteY = () => {
+      const addr = this.readWordPC();
+      const pc = this.addr;
+      const addrIdx = addr + this.yr & 65535;
+      this.workCycleIndexedRead(pc, addr, addrIdx);
+      return this.readByte(addrIdx);
+    };
+    // $00,X
+    readZeroPageX = () => {
+      const zpAddr = this.readBytePC();
+      this.readByte(zpAddr);
+      return this.readByte(zpAddr + this.xr & 255);
+    };
+    // $00,Y
+    readZeroPageY = () => {
+      const zpAddr = this.readBytePC();
+      this.readByte(zpAddr);
+      return this.readByte(zpAddr + this.yr & 255);
+    };
+    // ($00,X)
+    readZeroPageXIndirect = () => {
+      const zpAddr = this.readBytePC();
+      this.readByte(zpAddr);
+      const addr = this.readZPWord(zpAddr + this.xr & 255);
+      return this.readByte(addr);
+    };
+    // ($00),Y
+    readZeroPageIndirectY = () => {
+      const zpAddr = this.readBytePC();
+      const pc = this.addr;
+      const addr = this.readZPWord(zpAddr);
+      const addrIdx = addr + this.yr & 65535;
+      this.workCycleIndexedRead(pc, addr, addrIdx);
+      return this.readByte(addrIdx);
+    };
+    // ($00) (65C02)
+    readZeroPageIndirect = () => {
+      return this.readByte(this.readZPWord(this.readBytePC()));
+    };
+    /*
+     * Write Functions
+     */
+    // $0000
+    writeAbsolute = (val) => {
+      this.writeByte(this.readWordPC(), val);
+    };
+    // $00
+    writeZeroPage = (val) => {
+      this.writeByte(this.readBytePC(), val);
+    };
+    // $0000,X
+    writeAbsoluteX = (val) => {
+      const addr = this.readWordPC();
+      const pc = this.addr;
+      const addrIdx = addr + this.xr & 65535;
+      this.workCycleIndexedWrite(pc, addr, addrIdx);
+      this.writeByte(addrIdx, val);
+    };
+    // $0000,Y
+    writeAbsoluteY = (val) => {
+      const addr = this.readWordPC();
+      const pc = this.addr;
+      const addrIdx = addr + this.yr & 65535;
+      this.workCycleIndexedWrite(pc, addr, addrIdx);
+      this.writeByte(addrIdx, val);
+    };
+    // $00,X
+    writeZeroPageX = (val) => {
+      const zpAddr = this.readBytePC();
+      this.readByte(zpAddr);
+      this.writeByte(zpAddr + this.xr & 255, val);
+    };
+    // $00,Y
+    writeZeroPageY = (val) => {
+      const zpAddr = this.readBytePC();
+      this.readByte(zpAddr);
+      this.writeByte(zpAddr + this.yr & 255, val);
+    };
+    // ($00,X)
+    writeZeroPageXIndirect = (val) => {
+      const zpAddr = this.readBytePC();
+      this.readByte(zpAddr);
+      const addr = this.readZPWord(zpAddr + this.xr & 255);
+      this.writeByte(addr, val);
+    };
+    // ($00),Y
+    writeZeroPageIndirectY = (val) => {
+      const zpAddr = this.readBytePC();
+      const pc = this.addr;
+      const addr = this.readZPWord(zpAddr);
+      const addrIdx = addr + this.yr & 65535;
+      this.workCycleIndexedWrite(pc, addr, addrIdx);
+      this.writeByte(addrIdx, val);
+    };
+    // ($00) (65C02)
+    writeZeroPageIndirect = (val) => {
+      this.writeByte(this.readZPWord(this.readBytePC()), val);
+    };
+    // $00
+    readAddrZeroPage = () => {
+      return this.readBytePC();
+    };
+    // $00,X
+    readAddrZeroPageX = () => {
+      const zpAddr = this.readBytePC();
+      this.readByte(zpAddr);
+      return zpAddr + this.xr & 255;
+    };
+    // $0000 (65C02)
+    readAddrAbsolute = () => {
+      return this.readWordPC();
+    };
+    // ($0000) (6502)
+    readAddrAbsoluteIndirectBug = () => {
+      const addr = this.readWordPC();
+      const page = addr & 65280;
+      const off = addr & 255;
+      const lsb = this.readByte(addr);
+      const msb = this.readByte(page | off + 1 & 255);
+      return msb << 8 | lsb;
+    };
+    // ($0000) (65C02)
+    readAddrAbsoluteIndirect = () => {
+      const addr = this.readWord(this.readWordPC());
+      this.readByte(this.addr);
+      return addr;
+    };
+    // $0000,X
+    readAddrAbsoluteX = (opts) => {
+      let addr = this.readWordPC();
+      const page = addr & 65280;
+      addr = addr + this.xr & 65535;
+      if (this.is65C02) {
+        if (opts?.inc) {
+          this.readByte(this.addr);
+        } else {
+          const newPage = addr & 65280;
+          if (page !== newPage) {
+            this.readByte(this.addr);
+          }
+        }
+      } else {
+        const off = addr & 255;
+        this.readByte(page | off);
+      }
+      return addr;
+    };
+    // $0000,Y (NMOS 6502)
+    readAddrAbsoluteY = () => {
+      let addr = this.readWordPC();
+      const page = addr & 65280;
+      addr = addr + this.yr & 65535;
+      const off = addr & 255;
+      this.readByte(page | off);
+      return addr;
+    };
+    // ($00,X) (NMOS 6502)
+    readAddrZeroPageXIndirect = () => {
+      const zpAddr = this.readBytePC();
+      this.readByte(zpAddr);
+      return this.readZPWord(zpAddr + this.xr & 255);
+    };
+    // ($00),Y (NMOS 6502)
+    readAddrZeroPageIndirectY = () => {
+      const zpAddr = this.readBytePC();
+      const addr = this.readZPWord(zpAddr);
+      const addrIdx = addr + this.yr & 65535;
+      const oldPage = addr & 65280;
+      const off = addrIdx & 255;
+      this.readByte(oldPage | off);
+      return addrIdx;
+    };
+    // $(0000,X) (65C02)
+    readAddrAbsoluteXIndirect = () => {
+      const lsb = this.readBytePC();
+      const pc = this.addr;
+      const msb = this.readBytePC();
+      const addr = (msb << 8 | lsb) + this.xr & 65535;
+      this.readByte(pc);
+      return this.readWord(addr);
+    };
+    // 5C, DC, FC NOP (65C02)
+    readNop = () => {
+      this.readWordPC();
+      this.readByte(this.addr);
+    };
+    // NOP (65C02)
+    readNopImplied = () => {
+    };
+    /* Break */
+    brk = (readFn) => {
+      readFn();
+      this.pushWord(this.pc);
+      this.pushByte(this.sr | flags.B);
+      if (this.is65C02) {
+        this.setFlag(flags.D, false);
+      }
+      this.setFlag(flags.I, true);
+      this.pc = this.readWord(loc.BRK);
+    };
+    /* Stop (65C02) */
+    stp = () => {
+      this.stop = true;
+      this.readByte(this.pc);
+      this.readByte(this.pc);
+    };
+    /* Wait (65C02) */
+    wai = () => {
+      this.wait = true;
+      this.readByte(this.pc);
+      this.readByte(this.pc);
+    };
+    /* Load Accumulator */
+    lda = (readFn) => {
+      this.ar = this.testNZ(readFn());
+    };
+    /* Load X Register */
+    ldx = (readFn) => {
+      this.xr = this.testNZ(readFn());
+    };
+    /* Load Y Register */
+    ldy = (readFn) => {
+      this.yr = this.testNZ(readFn());
+    };
+    /* Store Accumulator */
+    sta = (writeFn) => {
+      writeFn(this.ar);
+    };
+    /* Store X Register */
+    stx = (writeFn) => {
+      writeFn(this.xr);
+    };
+    /* Store Y Register */
+    sty = (writeFn) => {
+      writeFn(this.yr);
+    };
+    /* Store Zero */
+    stz = (writeFn) => {
+      writeFn(0);
+    };
+    /* Add with Carry */
+    adc = (readFn) => {
+      this.ar = this.add(
+        this.ar,
+        readFn(),
+        /* sub= */
+        false
+      );
+    };
+    /* Subtract with Carry */
+    sbc = (readFn) => {
+      this.ar = this.add(
+        this.ar,
+        readFn() ^ 255,
+        /* sub= */
+        true
+      );
+    };
+    /* Increment Memory */
+    incA = () => {
+      this.readByte(this.pc);
+      this.ar = this.increment(this.ar);
+    };
+    inc = (readAddrFn) => {
+      const addr = readAddrFn({ inc: true });
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.increment(oldVal);
+      this.writeByte(addr, val);
+    };
+    /* Increment X */
+    inx = () => {
+      this.readByte(this.pc);
+      this.xr = this.increment(this.xr);
+    };
+    /* Increment Y */
+    iny = () => {
+      this.readByte(this.pc);
+      this.yr = this.increment(this.yr);
+    };
+    /* Decrement Memory */
+    decA = () => {
+      this.readByte(this.pc);
+      this.ar = this.decrement(this.ar);
+    };
+    dec = (readAddrFn) => {
+      const addr = readAddrFn({ inc: true });
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.decrement(oldVal);
+      this.writeByte(addr, val);
+    };
+    /* Decrement X */
+    dex = () => {
+      this.readByte(this.pc);
+      this.xr = this.decrement(this.xr);
+    };
+    /* Decrement Y */
+    dey = () => {
+      this.readByte(this.pc);
+      this.yr = this.decrement(this.yr);
+    };
+    shiftLeft = (val) => {
+      this.setFlag(flags.C, !!(val & 128));
+      return this.testNZ(val << 1 & 255);
+    };
+    /* Arithmetic Shift Left */
+    aslA = () => {
+      this.readByte(this.pc);
+      this.ar = this.shiftLeft(this.ar);
+    };
+    asl = (readAddrFn) => {
+      const addr = readAddrFn();
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.shiftLeft(oldVal);
+      this.writeByte(addr, val);
+    };
+    shiftRight = (val) => {
+      this.setFlag(flags.C, !!(val & 1));
+      return this.testNZ(val >> 1);
+    };
+    /* Logical Shift Right */
+    lsrA = () => {
+      this.readByte(this.pc);
+      this.ar = this.shiftRight(this.ar);
+    };
+    lsr = (readAddrFn) => {
+      const addr = readAddrFn();
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.shiftRight(oldVal);
+      this.writeByte(addr, val);
+    };
+    rotateLeft = (val) => {
+      const c = this.sr & flags.C;
+      this.setFlag(flags.C, !!(val & 128));
+      return this.testNZ((val << 1 | (c ? 1 : 0)) & 255);
+    };
+    /* Rotate Left */
+    rolA = () => {
+      this.readByte(this.pc);
+      this.ar = this.rotateLeft(this.ar);
+    };
+    rol = (readAddrFn) => {
+      const addr = readAddrFn();
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.rotateLeft(oldVal);
+      this.writeByte(addr, val);
+    };
+    rotateRight(a) {
+      const c = this.sr & flags.C;
+      this.setFlag(flags.C, !!(a & 1));
+      return this.testNZ(a >> 1 | (c ? 128 : 0));
+    }
+    /* Rotate Right */
+    rorA = () => {
+      this.readByte(this.pc);
+      this.ar = this.rotateRight(this.ar);
+    };
+    ror = (readAddrFn) => {
+      const addr = readAddrFn();
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.rotateRight(oldVal);
+      this.writeByte(addr, val);
+    };
+    /* Logical And Accumulator */
+    and = (readFn) => {
+      this.ar = this.testNZ(this.ar & readFn());
+    };
+    /* Logical Or Accumulator */
+    ora = (readFn) => {
+      this.ar = this.testNZ(this.ar | readFn());
+    };
+    /* Logical Exclusive Or Accumulator */
+    eor = (readFn) => {
+      this.ar = this.testNZ(this.ar ^ readFn());
+    };
+    /* Reset Bit */
+    rmb = (b) => {
+      const bit = 1 << b ^ 255;
+      const addr = this.readBytePC();
+      let val = this.readByte(addr);
+      this.readByte(addr);
+      val &= bit;
+      this.writeByte(addr, val);
+    };
+    /* Set Bit */
+    smb = (b) => {
+      const bit = 1 << b;
+      const addr = this.readBytePC();
+      let val = this.readByte(addr);
+      this.readByte(addr);
+      val |= bit;
+      this.writeByte(addr, val);
+    };
+    /* Test and Reset Bits */
+    trb = (readAddrFn) => {
+      const addr = readAddrFn();
+      const val = this.readByte(addr);
+      this.testZ(val & this.ar);
+      this.readByte(addr);
+      this.writeByte(addr, val & ~this.ar);
+    };
+    /* Test and Set Bits */
+    tsb = (readAddrFn) => {
+      const addr = readAddrFn();
+      const val = this.readByte(addr);
+      this.testZ(val & this.ar);
+      this.readByte(addr);
+      this.writeByte(addr, val | this.ar);
+    };
+    /* Bit */
+    bit = (readFn) => {
+      const val = readFn();
+      this.setFlag(flags.Z, (val & this.ar) === 0);
+      this.setFlag(flags.N, !!(val & 128));
+      this.setFlag(flags.V, !!(val & 64));
+    };
+    /* Bit Immediate*/
+    bitI = (readFn) => {
+      const val = readFn();
+      this.setFlag(flags.Z, (val & this.ar) === 0);
+    };
+    compare(a, b) {
+      b = b ^ 255;
+      const c = a + b + 1;
+      this.setFlag(flags.C, c > 255);
+      this.testNZ(c & 255);
+    }
+    cmp = (readFn) => {
+      this.compare(this.ar, readFn());
+    };
+    cpx = (readFn) => {
+      this.compare(this.xr, readFn());
+    };
+    cpy = (readFn) => {
+      this.compare(this.yr, readFn());
+    };
+    /* Branches */
+    brs = (f) => {
+      const off = this.readBytePC();
+      if ((f & this.sr) !== 0) {
+        this.readByte(this.pc);
+        const oldPage = this.pc & 65280;
+        this.pc += off > 127 ? off - 256 : off;
+        this.pc &= 65535;
+        const newPage = this.pc & 65280;
+        const newOff = this.pc & 255;
+        if (newPage !== oldPage) this.readByte(oldPage | newOff);
+      }
+    };
+    brc = (f) => {
+      const off = this.readBytePC();
+      if ((f & this.sr) === 0) {
+        this.readByte(this.pc);
+        const oldPage = this.pc & 65280;
+        this.pc += off > 127 ? off - 256 : off;
+        this.pc &= 65535;
+        const newPage = this.pc & 65280;
+        const newOff = this.pc & 255;
+        if (newPage !== oldPage) this.readByte(oldPage | newOff);
+      }
+    };
+    /* WDC 65C02 branches */
+    bbr = (b) => {
+      const zpAddr = this.readBytePC();
+      const val = this.readByte(zpAddr);
+      this.writeByte(zpAddr, val);
+      const off = this.readBytePC();
+      const oldPc = this.pc;
+      const oldPage = oldPc & 65280;
+      let newPC = this.pc + (off > 127 ? off - 256 : off);
+      newPC &= 65535;
+      const newOff = newPC & 255;
+      this.readByte(oldPage | newOff);
+      if ((1 << b & val) === 0) {
+        this.pc = newPC;
+      }
+    };
+    bbs = (b) => {
+      const zpAddr = this.readBytePC();
+      const val = this.readByte(zpAddr);
+      this.writeByte(zpAddr, val);
+      const off = this.readBytePC();
+      const oldPc = this.pc;
+      const oldPage = oldPc & 65280;
+      let newPC = this.pc + (off > 127 ? off - 256 : off);
+      newPC &= 65535;
+      const newOff = newPC & 255;
+      this.readByte(oldPage | newOff);
+      if ((1 << b & val) !== 0) {
+        this.pc = newPC;
+      }
+    };
+    /* Transfers and stack */
+    tax = () => {
+      this.readByte(this.pc);
+      this.testNZ(this.xr = this.ar);
+    };
+    txa = () => {
+      this.readByte(this.pc);
+      this.testNZ(this.ar = this.xr);
+    };
+    tay = () => {
+      this.readByte(this.pc);
+      this.testNZ(this.yr = this.ar);
+    };
+    tya = () => {
+      this.readByte(this.pc);
+      this.testNZ(this.ar = this.yr);
+    };
+    tsx = () => {
+      this.readByte(this.pc);
+      this.testNZ(this.xr = this.sp);
+    };
+    txs = () => {
+      this.readByte(this.pc);
+      this.sp = this.xr;
+    };
+    pha = () => {
+      this.readByte(this.pc);
+      this.pushByte(this.ar);
+    };
+    pla = () => {
+      this.readByte(this.pc);
+      this.readByte(256 | this.sp);
+      this.testNZ(this.ar = this.pullByte());
+    };
+    phx = () => {
+      this.readByte(this.pc);
+      this.pushByte(this.xr);
+    };
+    plx = () => {
+      this.readByte(this.pc);
+      this.readByte(256 | this.sp);
+      this.testNZ(this.xr = this.pullByte());
+    };
+    phy = () => {
+      this.readByte(this.pc);
+      this.pushByte(this.yr);
+    };
+    ply = () => {
+      this.readByte(this.pc);
+      this.readByte(256 | this.sp);
+      this.testNZ(this.yr = this.pullByte());
+    };
+    php = () => {
+      this.readByte(this.pc);
+      this.pushByte(this.sr | flags.B);
+    };
+    plp = () => {
+      this.readByte(this.pc);
+      this.readByte(256 | this.sp);
+      this.sr = this.pullByte() & ~flags.B | flags.X;
+    };
+    /* Jump */
+    jmp = (readAddrFn) => {
+      this.pc = readAddrFn();
+    };
+    /* Jump Subroutine */
+    jsr = () => {
+      const lsb = this.readBytePC();
+      this.readByte(256 | this.sp);
+      this.pushWord(this.pc);
+      const msb = this.readBytePC();
+      this.pc = (msb << 8 | lsb) & 65535;
+    };
+    /* Return from Subroutine */
+    rts = () => {
+      this.readByte(this.pc);
+      this.readByte(256 | this.sp);
+      const addr = this.pullWordRaw();
+      this.readByte(addr);
+      this.pc = addr + 1 & 65535;
+    };
+    /* Return from Interrupt */
+    rti = () => {
+      this.readByte(this.pc);
+      this.readByte(256 | this.sp);
+      this.sr = this.pullByte() & ~flags.B | flags.X;
+      this.pc = this.pullWordRaw();
+    };
+    /* Set and Clear */
+    set = (flag) => {
+      this.readByte(this.pc);
+      this.sr |= flag;
+    };
+    clr = (flag) => {
+      this.readByte(this.pc);
+      this.sr &= ~flag;
+    };
+    /* No-Op */
+    nop = (readFn) => {
+      readFn();
+    };
+    /* NMOS 6502 Illegal opcodes */
+    /* ASO = ASL + ORA */
+    aso = (readAddrFn) => {
+      const addr = readAddrFn();
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.shiftLeft(oldVal);
+      this.writeByte(addr, val);
+      this.ar |= val;
+      this.testNZ(this.ar);
+    };
+    /* RLA = ROL + AND */
+    rla = (readAddrFn) => {
+      const addr = readAddrFn();
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.rotateLeft(oldVal);
+      this.writeByte(addr, val);
+      this.ar &= val;
+      this.testNZ(this.ar);
+    };
+    /* LSE = LSR + EOR */
+    lse = (readAddrFn) => {
+      const addr = readAddrFn();
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.shiftRight(oldVal);
+      this.writeByte(addr, val);
+      this.ar ^= val;
+      this.testNZ(this.ar);
+    };
+    /* RRA = ROR + ADC */
+    rra = (readAddrFn) => {
+      const addr = readAddrFn();
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.rotateRight(oldVal);
+      this.writeByte(addr, val);
+      this.ar = this.add(this.ar, val, false);
+    };
+    /* AXS = Store A & X */
+    axs = (writeFn) => {
+      writeFn(this.ar & this.xr);
+    };
+    /* LAX = Load A & X */
+    lax = (readFn) => {
+      const val = readFn();
+      this.ar = val;
+      this.xr = val;
+      this.testNZ(val);
+    };
+    /* DCM = DEC + CMP */
+    dcm = (readAddrFn) => {
+      const addr = readAddrFn({ inc: true });
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.decrement(oldVal);
+      this.writeByte(addr, val);
+      this.compare(this.ar, val);
+    };
+    /* INS = INC + SBC */
+    ins = (readAddrFn) => {
+      const addr = readAddrFn({ inc: true });
+      const oldVal = this.readByte(addr);
+      this.workCycle(addr, oldVal);
+      const val = this.increment(oldVal);
+      this.writeByte(addr, val);
+      this.ar = this.add(this.ar, val ^ 255, true);
+    };
+    /* ALR = AND + LSR */
+    alr = (readFn) => {
+      const val = readFn() & this.ar;
+      this.ar = this.shiftRight(val);
+    };
+    /* ARR = AND + ROR */
+    arr = (readFn) => {
+      const val = readFn() & this.ar;
+      const ah = val >> 4;
+      const al = val & 15;
+      const b7 = val >> 7;
+      const b6 = val >> 6 & 1;
+      this.ar = this.rotateRight(val);
+      let c = !!b7;
+      const v = !!(b7 ^ b6);
+      if (this.sr & flags.D) {
+        if (al + (al & 1) > 5) {
+          this.ar = this.ar & 240 | this.ar + 6 & 15;
+        }
+        if (ah + (ah & 1) > 5) {
+          c = true;
+          this.ar = this.ar + 96 & 255;
+        }
+      }
+      this.setFlag(flags.V, v);
+      this.setFlag(flags.C, c);
+    };
+    /* XAA = TAX + AND */
+    xaa = (readFn) => {
+      const val = readFn();
+      this.ar = this.xr & 238 | this.xr & this.ar & 17;
+      this.ar = this.testNZ(this.ar & val);
+    };
+    /** OAL = ORA + AND */
+    oal = (readFn) => {
+      this.ar |= 238;
+      const val = this.testNZ(this.ar & readFn());
+      this.ar = val;
+      this.xr = val;
+    };
+    /* SAX = A & X + SBC */
+    sax = (readFn) => {
+      const a = this.xr & this.ar;
+      let b = readFn();
+      b = b ^ 255;
+      const c = a + b + 1;
+      this.setFlag(flags.C, c > 255);
+      this.xr = this.testNZ(c & 255);
+    };
+    /* TAS = X & Y -> S */
+    tas = (readAddrFn) => {
+      const addr = readAddrFn();
+      let val = this.xr & this.ar;
+      this.sp = val;
+      const msb = addr >> 8;
+      val = val & (msb + 1 & 255);
+      this.writeByte(addr, val);
+    };
+    /* SAY = Y & AH + 1 */
+    say = (readAddrFn) => {
+      const addr = readAddrFn();
+      const msb = addr >> 8;
+      const val = this.yr & (msb + 1 & 255);
+      this.writeByte(addr, val);
+    };
+    /* XAS = X & AH + 1 */
+    xas = (readAddrFn) => {
+      const addr = readAddrFn();
+      const msb = addr >> 8;
+      const val = this.xr & (msb + 1 & 255);
+      this.writeByte(addr, val);
+    };
+    /* AXA = X & AH + 1 */
+    axa = (readAddrFn) => {
+      const addr = readAddrFn();
+      let val = this.xr & this.ar;
+      const msb = addr >> 8;
+      val = val & (msb + 1 & 255);
+      this.writeByte(addr, val);
+    };
+    /* ANC = AND with carry */
+    anc = (readFn) => {
+      this.ar = this.testNZ(this.ar & readFn());
+      const c = !!(this.ar & 128);
+      this.setFlag(flags.C, c);
+    };
+    /* LAS = RD & SP -> A, X, S */
+    las = (readFn) => {
+      const val = this.sp & readFn();
+      this.sp = val;
+      this.xr = val;
+      this.ar = this.testNZ(val);
+    };
+    /* SKB/SKW */
+    skp = (readFn) => {
+      readFn();
+    };
+    /* HLT */
+    hlt = (_impliedFn) => {
+      this.readByte(this.pc);
+      this.readByte(this.pc);
+      this.pc = --this.pc & 65535;
+      this.stop = true;
+    };
+    unknown(b) {
+      let unk;
+      if (this.is65C02) {
+        unk = {
+          name: "NOP",
+          fn: () => this.nop(this.readNopImplied),
+          mode: "implied"
+        };
+      } else {
+        throw new Error(`Missing ${toHex(b)}`);
+      }
+      return unk;
+    }
+    /**
+     * Execute a single instruction at the program counter address.
+     *
+     * @param cb Callback after instruction is executed
+     */
+    step(cb) {
+      this.sync = true;
+      this.op = this.opary[this.readBytePC()];
+      this.sync = false;
+      this.op.fn();
+      cb?.(this);
+    }
+    /**
+     * Execute n instructions, starting at the program counter address.
+     *
+     * @param cb Callback after each instruction is executed
+     */
+    stepN(n, cb) {
+      for (let idx = 0; idx < n; idx++) {
+        this.sync = true;
+        this.op = this.opary[this.readBytePC()];
+        this.sync = false;
+        this.op.fn();
+        if (cb?.(this)) {
+          return;
+        }
+      }
+    }
+    /**
+     * Execute c cycles worth instructions, starting at the program
+     * counter address.
+     */
+    stepCycles(c) {
+      const end = this.cycles + c;
+      while (this.cycles < end) {
+        this.sync = true;
+        this.op = this.opary[this.readBytePC()];
+        this.sync = false;
+        this.op.fn();
+      }
+    }
+    /**
+     * Execute c cycles worth instructions, starting at the program
+     * counter address.
+     *
+     * @param cb Callback after each instruction is executed
+     */
+    stepCyclesDebug(c, cb) {
+      const end = this.cycles + c;
+      while (this.cycles < end) {
+        this.sync = true;
+        this.op = this.opary[this.readBytePC()];
+        this.sync = false;
+        this.op.fn();
+        if (cb?.(this)) {
+          return;
+        }
+      }
+    }
+    /**
+     * Add a page handler. Page handlers cover specific pages in the
+     * 6502 address space. The page handler defines its own memory range.
+     * If multiple page handlers cover the same page range, the last
+     * added will be used.
+     *
+     * @param pageHandler The page handler to add.
+     */
+    addPageHandler(pageHandler) {
+      for (let idx = pageHandler.start(); idx <= pageHandler.end(); idx++) {
+        this.memPages[idx] = pageHandler;
+      }
+      if (isResettablePageHandler(pageHandler))
+        this.resetHandlers.push(pageHandler);
+    }
+    /**
+     * Simulate a RESET signal. The CPU will update its register states
+     * as appropriate and jump to the RESET vector.
+     */
+    reset() {
+      this.sr = flags.X;
+      this.sp = 255;
+      this.ar = 0;
+      this.yr = 0;
+      this.xr = 0;
+      this.pc = this.readWord(loc.RESET);
+      this.wait = false;
+      this.stop = false;
+      for (let idx = 0; idx < this.resetHandlers.length; idx++) {
+        this.resetHandlers[idx].reset();
+      }
+    }
+    /**
+     * Interrupt Request. Simulates a IRQ signal. If interrupts
+     * are enabled, will jump to the interrupt vector with the
+     * stack populated as expected.
+     */
+    irq() {
+      if ((this.sr & flags.I) === 0) {
+        this.pushWord(this.pc);
+        this.pushByte(this.sr & ~flags.B);
+        if (this.is65C02) {
+          this.setFlag(flags.D, false);
+        }
+        this.setFlag(flags.I, true);
+        this.pc = this.readWord(loc.BRK);
+        this.wait = false;
+      }
+    }
+    /**
+     * Non-maskable Interrupt. Simulates a NMI signal. Will
+     * jump to the interrupt vector with the stack populated as expected.
+     */
+    nmi() {
+      this.pushWord(this.pc);
+      this.pushByte(this.sr & ~flags.B);
+      if (this.is65C02) {
+        this.setFlag(flags.D, false);
+      }
+      this.setFlag(flags.I, true);
+      this.pc = this.readWord(loc.NMI);
+      this.wait = false;
+    }
+    /**
+     * Returns the current program counter register.
+     */
+    getPC() {
+      return this.pc;
+    }
+    /**
+     * Set the current program counter register.
+     */
+    setPC(pc) {
+      this.pc = pc;
+    }
+    getDebugInfo() {
+      const b = this.read(this.pc);
+      const op = this.opary[b];
+      const size = sizes[op.mode];
+      const cmd = new Array(size);
+      cmd[0] = b;
+      for (let idx = 1; idx < size; idx++) {
+        cmd[idx] = this.read(this.pc + idx);
+      }
+      return {
+        pc: this.pc,
+        ar: this.ar,
+        xr: this.xr,
+        yr: this.yr,
+        sr: this.sr,
+        sp: this.sp,
+        cmd
+      };
+    }
+    /**
+     * Returns the state of the SYNC signal. Indicates that the CPU
+     * is fetching an instruction.
+     */
+    getSync() {
+      return this.sync;
+    }
+    /**
+     * Returns the state of the STOP signal. True after a 65C02 `STP`
+     * instruction is encountered. Cleared by reset.
+     */
+    getStop() {
+      return this.stop;
+    }
+    /**
+     * Returns the state of the WAIT signal. True after a 65C02 `WAI`
+     * instruction is encountered. Cleared by reset.
+     */
+    getWait() {
+      return this.wait;
+    }
+    /**
+     * Returns the number of cycles processed since the CPU was instantiated.
+     * Could potentially overflow.
+     */
+    getCycles() {
+      return this.cycles;
+    }
+    /**
+     * Return the Instruction for the given byte value for the current
+     * CPU flavor.
+     */
+    getOpInfo(opcode) {
+      return this.opary[opcode];
+    }
+    /**
+     *
+     * @returns The register state of the cpu.
+     */
+    getState() {
+      return {
+        a: this.ar,
+        x: this.xr,
+        y: this.yr,
+        s: this.sr,
+        pc: this.pc,
+        sp: this.sp,
+        cycles: this.cycles
+      };
+    }
+    setState(state) {
+      this.ar = state.a;
+      this.xr = state.x;
+      this.yr = state.y;
+      this.sr = state.s;
+      this.pc = state.pc;
+      this.sp = state.sp;
+      this.cycles = state.cycles;
+    }
+    read(a, b) {
+      let page, off;
+      if (b !== void 0) {
+        page = a & 255;
+        off = b & 255;
+      } else {
+        page = a >> 8 & 255;
+        off = a & 255;
+      }
+      return this.memPages[page].read(page, off);
+    }
+    write(a, b, c) {
+      let page, off, val;
+      if (c !== void 0) {
+        page = a & 255;
+        off = b & 255;
+        val = c & 255;
+      } else {
+        page = a >> 8 & 255;
+        off = a & 255;
+        val = b & 255;
+      }
+      this.memPages[page].write(page, off, val);
+    }
+    /**
+     * Table of documented 6502 instructions.
+     */
+    OPS_6502 = {
+      // LDA
+      169: {
+        name: "LDA",
+        fn: () => this.lda(this.readImmediate),
+        mode: "immediate"
+      },
+      165: {
+        name: "LDA",
+        fn: () => this.lda(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      181: {
+        name: "LDA",
+        fn: () => this.lda(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      173: {
+        name: "LDA",
+        fn: () => this.lda(this.readAbsolute),
+        mode: "absolute"
+      },
+      189: {
+        name: "LDA",
+        fn: () => this.lda(this.readAbsoluteX),
+        mode: "absoluteX"
+      },
+      185: {
+        name: "LDA",
+        fn: () => this.lda(this.readAbsoluteY),
+        mode: "absoluteY"
+      },
+      161: {
+        name: "LDA",
+        fn: () => this.lda(this.readZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      177: {
+        name: "LDA",
+        fn: () => this.lda(this.readZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // LDX
+      162: {
+        name: "LDX",
+        fn: () => this.ldx(this.readImmediate),
+        mode: "immediate"
+      },
+      166: {
+        name: "LDX",
+        fn: () => this.ldx(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      182: {
+        name: "LDX",
+        fn: () => this.ldx(this.readZeroPageY),
+        mode: "zeroPageY"
+      },
+      174: {
+        name: "LDX",
+        fn: () => this.ldx(this.readAbsolute),
+        mode: "absolute"
+      },
+      190: {
+        name: "LDX",
+        fn: () => this.ldx(this.readAbsoluteY),
+        mode: "absoluteY"
+      },
+      // LDY
+      160: {
+        name: "LDY",
+        fn: () => this.ldy(this.readImmediate),
+        mode: "immediate"
+      },
+      164: {
+        name: "LDY",
+        fn: () => this.ldy(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      180: {
+        name: "LDY",
+        fn: () => this.ldy(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      172: {
+        name: "LDY",
+        fn: () => this.ldy(this.readAbsolute),
+        mode: "absolute"
+      },
+      188: {
+        name: "LDY",
+        fn: () => this.ldy(this.readAbsoluteX),
+        mode: "absoluteX"
+      },
+      // STA
+      133: {
+        name: "STA",
+        fn: () => this.sta(this.writeZeroPage),
+        mode: "zeroPage"
+      },
+      149: {
+        name: "STA",
+        fn: () => this.sta(this.writeZeroPageX),
+        mode: "zeroPageX"
+      },
+      141: {
+        name: "STA",
+        fn: () => this.sta(this.writeAbsolute),
+        mode: "absolute"
+      },
+      157: {
+        name: "STA",
+        fn: () => this.sta(this.writeAbsoluteX),
+        mode: "absoluteX"
+      },
+      153: {
+        name: "STA",
+        fn: () => this.sta(this.writeAbsoluteY),
+        mode: "absoluteY"
+      },
+      129: {
+        name: "STA",
+        fn: () => this.sta(this.writeZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      145: {
+        name: "STA",
+        fn: () => this.sta(this.writeZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // STX
+      134: {
+        name: "STX",
+        fn: () => this.stx(this.writeZeroPage),
+        mode: "zeroPage"
+      },
+      150: {
+        name: "STX",
+        fn: () => this.stx(this.writeZeroPageY),
+        mode: "zeroPageY"
+      },
+      142: {
+        name: "STX",
+        fn: () => this.stx(this.writeAbsolute),
+        mode: "absolute"
+      },
+      // STY
+      132: {
+        name: "STY",
+        fn: () => this.sty(this.writeZeroPage),
+        mode: "zeroPage"
+      },
+      148: {
+        name: "STY",
+        fn: () => this.sty(this.writeZeroPageX),
+        mode: "zeroPageX"
+      },
+      140: {
+        name: "STY",
+        fn: () => this.sty(this.writeAbsolute),
+        mode: "absolute"
+      },
+      // ADC
+      105: {
+        name: "ADC",
+        fn: () => this.adc(this.readImmediate),
+        mode: "immediate"
+      },
+      101: {
+        name: "ADC",
+        fn: () => this.adc(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      117: {
+        name: "ADC",
+        fn: () => this.adc(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      109: {
+        name: "ADC",
+        fn: () => this.adc(this.readAbsolute),
+        mode: "absolute"
+      },
+      125: {
+        name: "ADC",
+        fn: () => this.adc(this.readAbsoluteX),
+        mode: "absoluteX"
+      },
+      121: {
+        name: "ADC",
+        fn: () => this.adc(this.readAbsoluteY),
+        mode: "absoluteY"
+      },
+      97: {
+        name: "ADC",
+        fn: () => this.adc(this.readZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      113: {
+        name: "ADC",
+        fn: () => this.adc(this.readZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // SBC
+      233: {
+        name: "SBC",
+        fn: () => this.sbc(this.readImmediate),
+        mode: "immediate"
+      },
+      229: {
+        name: "SBC",
+        fn: () => this.sbc(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      245: {
+        name: "SBC",
+        fn: () => this.sbc(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      237: {
+        name: "SBC",
+        fn: () => this.sbc(this.readAbsolute),
+        mode: "absolute"
+      },
+      253: {
+        name: "SBC",
+        fn: () => this.sbc(this.readAbsoluteX),
+        mode: "absoluteX"
+      },
+      249: {
+        name: "SBC",
+        fn: () => this.sbc(this.readAbsoluteY),
+        mode: "absoluteY"
+      },
+      225: {
+        name: "SBC",
+        fn: () => this.sbc(this.readZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      241: {
+        name: "SBC",
+        fn: () => this.sbc(this.readZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // INC
+      230: {
+        name: "INC",
+        fn: () => this.inc(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      246: {
+        name: "INC",
+        fn: () => this.inc(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      238: {
+        name: "INC",
+        fn: () => this.inc(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      254: {
+        name: "INC",
+        fn: () => this.inc(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      // INX
+      232: { name: "INX", fn: () => this.inx(), mode: "implied" },
+      // INY
+      200: { name: "INY", fn: () => this.iny(), mode: "implied" },
+      // DEC
+      198: {
+        name: "DEC",
+        fn: () => this.dec(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      214: {
+        name: "DEC",
+        fn: () => this.dec(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      206: {
+        name: "DEC",
+        fn: () => this.dec(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      222: {
+        name: "DEC",
+        fn: () => this.dec(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      // DEX
+      202: { name: "DEX", fn: () => this.dex(), mode: "implied" },
+      // DEY
+      136: { name: "DEY", fn: () => this.dey(), mode: "implied" },
+      // ASL
+      10: { name: "ASL", fn: () => this.aslA(), mode: "accumulator" },
+      6: {
+        name: "ASL",
+        fn: () => this.asl(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      22: {
+        name: "ASL",
+        fn: () => this.asl(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      14: {
+        name: "ASL",
+        fn: () => this.asl(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      30: {
+        name: "ASL",
+        fn: () => this.asl(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      // LSR
+      74: { name: "LSR", fn: () => this.lsrA(), mode: "accumulator" },
+      70: {
+        name: "LSR",
+        fn: () => this.lsr(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      86: {
+        name: "LSR",
+        fn: () => this.lsr(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      78: {
+        name: "LSR",
+        fn: () => this.lsr(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      94: {
+        name: "LSR",
+        fn: () => this.lsr(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      // ROL
+      42: { name: "ROL", fn: () => this.rolA(), mode: "accumulator" },
+      38: {
+        name: "ROL",
+        fn: () => this.rol(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      54: {
+        name: "ROL",
+        fn: () => this.rol(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      46: {
+        name: "ROL",
+        fn: () => this.rol(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      62: {
+        name: "ROL",
+        fn: () => this.rol(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      // ROR
+      106: { name: "ROR", fn: () => this.rorA(), mode: "accumulator" },
+      102: {
+        name: "ROR",
+        fn: () => this.ror(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      118: {
+        name: "ROR",
+        fn: () => this.ror(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      110: {
+        name: "ROR",
+        fn: () => this.ror(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      126: {
+        name: "ROR",
+        fn: () => this.ror(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      // AND
+      41: {
+        name: "AND",
+        fn: () => this.and(this.readImmediate),
+        mode: "immediate"
+      },
+      37: {
+        name: "AND",
+        fn: () => this.and(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      53: {
+        name: "AND",
+        fn: () => this.and(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      45: {
+        name: "AND",
+        fn: () => this.and(this.readAbsolute),
+        mode: "absolute"
+      },
+      61: {
+        name: "AND",
+        fn: () => this.and(this.readAbsoluteX),
+        mode: "absoluteX"
+      },
+      57: {
+        name: "AND",
+        fn: () => this.and(this.readAbsoluteY),
+        mode: "absoluteY"
+      },
+      33: {
+        name: "AND",
+        fn: () => this.and(this.readZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      49: {
+        name: "AND",
+        fn: () => this.and(this.readZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // ORA
+      9: {
+        name: "ORA",
+        fn: () => this.ora(this.readImmediate),
+        mode: "immediate"
+      },
+      5: {
+        name: "ORA",
+        fn: () => this.ora(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      21: {
+        name: "ORA",
+        fn: () => this.ora(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      13: {
+        name: "ORA",
+        fn: () => this.ora(this.readAbsolute),
+        mode: "absolute"
+      },
+      29: {
+        name: "ORA",
+        fn: () => this.ora(this.readAbsoluteX),
+        mode: "absoluteX"
+      },
+      25: {
+        name: "ORA",
+        fn: () => this.ora(this.readAbsoluteY),
+        mode: "absoluteY"
+      },
+      1: {
+        name: "ORA",
+        fn: () => this.ora(this.readZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      17: {
+        name: "ORA",
+        fn: () => this.ora(this.readZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // EOR
+      73: {
+        name: "EOR",
+        fn: () => this.eor(this.readImmediate),
+        mode: "immediate"
+      },
+      69: {
+        name: "EOR",
+        fn: () => this.eor(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      85: {
+        name: "EOR",
+        fn: () => this.eor(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      77: {
+        name: "EOR",
+        fn: () => this.eor(this.readAbsolute),
+        mode: "absolute"
+      },
+      93: {
+        name: "EOR",
+        fn: () => this.eor(this.readAbsoluteX),
+        mode: "absoluteX"
+      },
+      89: {
+        name: "EOR",
+        fn: () => this.eor(this.readAbsoluteY),
+        mode: "absoluteY"
+      },
+      65: {
+        name: "EOR",
+        fn: () => this.eor(this.readZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      81: {
+        name: "EOR",
+        fn: () => this.eor(this.readZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // CMP
+      201: {
+        name: "CMP",
+        fn: () => this.cmp(this.readImmediate),
+        mode: "immediate"
+      },
+      197: {
+        name: "CMP",
+        fn: () => this.cmp(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      213: {
+        name: "CMP",
+        fn: () => this.cmp(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      205: {
+        name: "CMP",
+        fn: () => this.cmp(this.readAbsolute),
+        mode: "absolute"
+      },
+      221: {
+        name: "CMP",
+        fn: () => this.cmp(this.readAbsoluteX),
+        mode: "absoluteX"
+      },
+      217: {
+        name: "CMP",
+        fn: () => this.cmp(this.readAbsoluteY),
+        mode: "absoluteY"
+      },
+      193: {
+        name: "CMP",
+        fn: () => this.cmp(this.readZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      209: {
+        name: "CMP",
+        fn: () => this.cmp(this.readZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // CPX
+      224: {
+        name: "CPX",
+        fn: () => this.cpx(this.readImmediate),
+        mode: "immediate"
+      },
+      228: {
+        name: "CPX",
+        fn: () => this.cpx(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      236: {
+        name: "CPX",
+        fn: () => this.cpx(this.readAbsolute),
+        mode: "absolute"
+      },
+      // CPY
+      192: {
+        name: "CPY",
+        fn: () => this.cpy(this.readImmediate),
+        mode: "immediate"
+      },
+      196: {
+        name: "CPY",
+        fn: () => this.cpy(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      204: {
+        name: "CPY",
+        fn: () => this.cpy(this.readAbsolute),
+        mode: "absolute"
+      },
+      // BIT
+      36: {
+        name: "BIT",
+        fn: () => this.bit(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      44: {
+        name: "BIT",
+        fn: () => this.bit(this.readAbsolute),
+        mode: "absolute"
+      },
+      // BCC
+      144: { name: "BCC", fn: () => this.brc(flags.C), mode: "relative" },
+      // BCS
+      176: { name: "BCS", fn: () => this.brs(flags.C), mode: "relative" },
+      // BEQ
+      240: { name: "BEQ", fn: () => this.brs(flags.Z), mode: "relative" },
+      // BMI
+      48: { name: "BMI", fn: () => this.brs(flags.N), mode: "relative" },
+      // BNE
+      208: { name: "BNE", fn: () => this.brc(flags.Z), mode: "relative" },
+      // BPL
+      16: { name: "BPL", fn: () => this.brc(flags.N), mode: "relative" },
+      // BVC
+      80: { name: "BVC", fn: () => this.brc(flags.V), mode: "relative" },
+      // BVS
+      112: { name: "BVS", fn: () => this.brs(flags.V), mode: "relative" },
+      // TAX
+      170: { name: "TAX", fn: () => this.tax(), mode: "implied" },
+      // TXA
+      138: { name: "TXA", fn: () => this.txa(), mode: "implied" },
+      // TAY
+      168: { name: "TAY", fn: () => this.tay(), mode: "implied" },
+      // TYA
+      152: { name: "TYA", fn: () => this.tya(), mode: "implied" },
+      // TSX
+      186: { name: "TSX", fn: () => this.tsx(), mode: "implied" },
+      // TXS
+      154: { name: "TXS", fn: () => this.txs(), mode: "implied" },
+      // PHA
+      72: { name: "PHA", fn: () => this.pha(), mode: "implied" },
+      // PLA
+      104: { name: "PLA", fn: () => this.pla(), mode: "implied" },
+      // PHP
+      8: { name: "PHP", fn: () => this.php(), mode: "implied" },
+      // PLP
+      40: { name: "PLP", fn: () => this.plp(), mode: "implied" },
+      // JMP
+      76: {
+        name: "JMP",
+        fn: () => this.jmp(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      108: {
+        name: "JMP",
+        fn: () => this.jmp(this.readAddrAbsoluteIndirectBug),
+        mode: "absoluteIndirect"
+      },
+      // JSR
+      32: { name: "JSR", fn: () => this.jsr(), mode: "absolute" },
+      // RTS
+      96: { name: "RTS", fn: () => this.rts(), mode: "implied" },
+      // RTI
+      64: { name: "RTI", fn: () => this.rti(), mode: "implied" },
+      // SEC
+      56: { name: "SEC", fn: () => this.set(flags.C), mode: "implied" },
+      // SED
+      248: { name: "SED", fn: () => this.set(flags.D), mode: "implied" },
+      // SEI
+      120: { name: "SEI", fn: () => this.set(flags.I), mode: "implied" },
+      // CLC
+      24: { name: "CLC", fn: () => this.clr(flags.C), mode: "implied" },
+      // CLD
+      216: { name: "CLD", fn: () => this.clr(flags.D), mode: "implied" },
+      // CLI
+      88: { name: "CLI", fn: () => this.clr(flags.I), mode: "implied" },
+      // CLV
+      184: { name: "CLV", fn: () => this.clr(flags.V), mode: "implied" },
+      // NOP
+      234: {
+        name: "NOP",
+        fn: () => this.nop(this.implied),
+        mode: "implied"
+      },
+      // BRK
+      0: {
+        name: "BRK",
+        fn: () => this.brk(this.readImmediate),
+        mode: "immediate"
+      }
+    };
+    /**
+     * Table of common documented 65C02 instructions
+     */
+    OPS_65C02 = {
+      // INC / DEC A
+      26: { name: "INC", fn: () => this.incA(), mode: "accumulator" },
+      58: { name: "DEC", fn: () => this.decA(), mode: "accumulator" },
+      // Indirect Zero Page for the masses
+      18: {
+        name: "ORA",
+        fn: () => this.ora(this.readZeroPageIndirect),
+        mode: "zeroPageIndirect"
+      },
+      50: {
+        name: "AND",
+        fn: () => this.and(this.readZeroPageIndirect),
+        mode: "zeroPageIndirect"
+      },
+      82: {
+        name: "EOR",
+        fn: () => this.eor(this.readZeroPageIndirect),
+        mode: "zeroPageIndirect"
+      },
+      114: {
+        name: "ADC",
+        fn: () => this.adc(this.readZeroPageIndirect),
+        mode: "zeroPageIndirect"
+      },
+      146: {
+        name: "STA",
+        fn: () => this.sta(this.writeZeroPageIndirect),
+        mode: "zeroPageIndirect"
+      },
+      178: {
+        name: "LDA",
+        fn: () => this.lda(this.readZeroPageIndirect),
+        mode: "zeroPageIndirect"
+      },
+      210: {
+        name: "CMP",
+        fn: () => this.cmp(this.readZeroPageIndirect),
+        mode: "zeroPageIndirect"
+      },
+      242: {
+        name: "SBC",
+        fn: () => this.sbc(this.readZeroPageIndirect),
+        mode: "zeroPageIndirect"
+      },
+      // Better BIT
+      52: {
+        name: "BIT",
+        fn: () => this.bit(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      60: {
+        name: "BIT",
+        fn: () => this.bit(this.readAbsoluteX),
+        mode: "absoluteX"
+      },
+      137: {
+        name: "BIT",
+        fn: () => this.bitI(this.readImmediate),
+        mode: "immediate"
+      },
+      // JMP absolute indirect indexed
+      108: {
+        name: "JMP",
+        fn: () => this.jmp(this.readAddrAbsoluteIndirect),
+        mode: "absoluteIndirect"
+      },
+      124: {
+        name: "JMP",
+        fn: () => this.jmp(this.readAddrAbsoluteXIndirect),
+        mode: "absoluteXIndirect"
+      },
+      // BBR/BBS
+      15: {
+        name: "BBR0",
+        fn: () => this.bbr(0),
+        mode: "zeroPage_relative"
+      },
+      31: {
+        name: "BBR1",
+        fn: () => this.bbr(1),
+        mode: "zeroPage_relative"
+      },
+      47: {
+        name: "BBR2",
+        fn: () => this.bbr(2),
+        mode: "zeroPage_relative"
+      },
+      63: {
+        name: "BBR3",
+        fn: () => this.bbr(3),
+        mode: "zeroPage_relative"
+      },
+      79: {
+        name: "BBR4",
+        fn: () => this.bbr(4),
+        mode: "zeroPage_relative"
+      },
+      95: {
+        name: "BBR5",
+        fn: () => this.bbr(5),
+        mode: "zeroPage_relative"
+      },
+      111: {
+        name: "BBR6",
+        fn: () => this.bbr(6),
+        mode: "zeroPage_relative"
+      },
+      127: {
+        name: "BBR7",
+        fn: () => this.bbr(7),
+        mode: "zeroPage_relative"
+      },
+      143: {
+        name: "BBS0",
+        fn: () => this.bbs(0),
+        mode: "zeroPage_relative"
+      },
+      159: {
+        name: "BBS1",
+        fn: () => this.bbs(1),
+        mode: "zeroPage_relative"
+      },
+      175: {
+        name: "BBS2",
+        fn: () => this.bbs(2),
+        mode: "zeroPage_relative"
+      },
+      191: {
+        name: "BBS3",
+        fn: () => this.bbs(3),
+        mode: "zeroPage_relative"
+      },
+      207: {
+        name: "BBS4",
+        fn: () => this.bbs(4),
+        mode: "zeroPage_relative"
+      },
+      223: {
+        name: "BBS5",
+        fn: () => this.bbs(5),
+        mode: "zeroPage_relative"
+      },
+      239: {
+        name: "BBS6",
+        fn: () => this.bbs(6),
+        mode: "zeroPage_relative"
+      },
+      255: {
+        name: "BBS7",
+        fn: () => this.bbs(7),
+        mode: "zeroPage_relative"
+      },
+      // BRA
+      128: { name: "BRA", fn: () => this.brc(0), mode: "relative" },
+      // NOP
+      2: {
+        name: "NOP",
+        fn: () => this.nop(this.readImmediate),
+        mode: "immediate"
+      },
+      34: {
+        name: "NOP",
+        fn: () => this.nop(this.readImmediate),
+        mode: "immediate"
+      },
+      66: {
+        name: "NOP",
+        fn: () => this.nop(this.readImmediate),
+        mode: "immediate"
+      },
+      68: {
+        name: "NOP",
+        fn: () => this.nop(this.readZeroPage),
+        mode: "immediate"
+      },
+      84: {
+        name: "NOP",
+        fn: () => this.nop(this.readZeroPageX),
+        mode: "immediate"
+      },
+      98: {
+        name: "NOP",
+        fn: () => this.nop(this.readImmediate),
+        mode: "immediate"
+      },
+      130: {
+        name: "NOP",
+        fn: () => this.nop(this.readImmediate),
+        mode: "immediate"
+      },
+      194: {
+        name: "NOP",
+        fn: () => this.nop(this.readImmediate),
+        mode: "immediate"
+      },
+      212: {
+        name: "NOP",
+        fn: () => this.nop(this.readZeroPageX),
+        mode: "immediate"
+      },
+      226: {
+        name: "NOP",
+        fn: () => this.nop(this.readImmediate),
+        mode: "immediate"
+      },
+      244: {
+        name: "NOP",
+        fn: () => this.nop(this.readZeroPageX),
+        mode: "immediate"
+      },
+      92: {
+        name: "NOP",
+        fn: () => this.nop(this.readNop),
+        mode: "absolute"
+      },
+      220: {
+        name: "NOP",
+        fn: () => this.nop(this.readNop),
+        mode: "absolute"
+      },
+      252: {
+        name: "NOP",
+        fn: () => this.nop(this.readNop),
+        mode: "absolute"
+      },
+      // PHX
+      218: { name: "PHX", fn: () => this.phx(), mode: "implied" },
+      // PHY
+      90: { name: "PHY", fn: () => this.phy(), mode: "implied" },
+      // PLX
+      250: { name: "PLX", fn: () => this.plx(), mode: "implied" },
+      // PLY
+      122: { name: "PLY", fn: () => this.ply(), mode: "implied" },
+      // RMB/SMB
+      7: { name: "RMB0", fn: () => this.rmb(0), mode: "zeroPage" },
+      23: { name: "RMB1", fn: () => this.rmb(1), mode: "zeroPage" },
+      39: { name: "RMB2", fn: () => this.rmb(2), mode: "zeroPage" },
+      55: { name: "RMB3", fn: () => this.rmb(3), mode: "zeroPage" },
+      71: { name: "RMB4", fn: () => this.rmb(4), mode: "zeroPage" },
+      87: { name: "RMB5", fn: () => this.rmb(5), mode: "zeroPage" },
+      103: { name: "RMB6", fn: () => this.rmb(6), mode: "zeroPage" },
+      119: { name: "RMB7", fn: () => this.rmb(7), mode: "zeroPage" },
+      135: { name: "SMB0", fn: () => this.smb(0), mode: "zeroPage" },
+      151: { name: "SMB1", fn: () => this.smb(1), mode: "zeroPage" },
+      167: { name: "SMB2", fn: () => this.smb(2), mode: "zeroPage" },
+      183: { name: "SMB3", fn: () => this.smb(3), mode: "zeroPage" },
+      199: { name: "SMB4", fn: () => this.smb(4), mode: "zeroPage" },
+      215: { name: "SMB5", fn: () => this.smb(5), mode: "zeroPage" },
+      231: { name: "SMB6", fn: () => this.smb(6), mode: "zeroPage" },
+      247: { name: "SMB7", fn: () => this.smb(7), mode: "zeroPage" },
+      // STZ
+      100: {
+        name: "STZ",
+        fn: () => this.stz(this.writeZeroPage),
+        mode: "zeroPage"
+      },
+      116: {
+        name: "STZ",
+        fn: () => this.stz(this.writeZeroPageX),
+        mode: "zeroPageX"
+      },
+      156: {
+        name: "STZ",
+        fn: () => this.stz(this.writeAbsolute),
+        mode: "absolute"
+      },
+      158: {
+        name: "STZ",
+        fn: () => this.stz(this.writeAbsoluteX),
+        mode: "absoluteX"
+      },
+      // TRB
+      20: {
+        name: "TRB",
+        fn: () => this.trb(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      28: {
+        name: "TRB",
+        fn: () => this.trb(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      // TSB
+      4: {
+        name: "TSB",
+        fn: () => this.tsb(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      12: {
+        name: "TSB",
+        fn: () => this.tsb(this.readAddrAbsolute),
+        mode: "absolute"
+      }
+    };
+    /**
+     * Table of undocumented NMOS 6502 instructions
+     */
+    OPS_NMOS_6502 = {
+      // ASO
+      15: {
+        name: "ASO",
+        fn: () => this.aso(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      31: {
+        name: "ASO",
+        fn: () => this.aso(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      27: {
+        name: "ASO",
+        fn: () => this.aso(this.readAddrAbsoluteY),
+        mode: "absoluteY"
+      },
+      7: {
+        name: "ASO",
+        fn: () => this.aso(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      23: {
+        name: "ASO",
+        fn: () => this.aso(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      3: {
+        name: "ASO",
+        fn: () => this.aso(this.readAddrZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      19: {
+        name: "ASO",
+        fn: () => this.aso(this.readAddrZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // RLA
+      47: {
+        name: "RLA",
+        fn: () => this.rla(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      63: {
+        name: "RLA",
+        fn: () => this.rla(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      59: {
+        name: "RLA",
+        fn: () => this.rla(this.readAddrAbsoluteY),
+        mode: "absoluteY"
+      },
+      39: {
+        name: "RLA",
+        fn: () => this.rla(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      55: {
+        name: "RLA",
+        fn: () => this.rla(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      35: {
+        name: "RLA",
+        fn: () => this.rla(this.readAddrZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      51: {
+        name: "RLA",
+        fn: () => this.rla(this.readAddrZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // LSE
+      79: {
+        name: "LSE",
+        fn: () => this.lse(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      95: {
+        name: "LSE",
+        fn: () => this.lse(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      91: {
+        name: "LSE",
+        fn: () => this.lse(this.readAddrAbsoluteY),
+        mode: "absoluteY"
+      },
+      71: {
+        name: "LSE",
+        fn: () => this.lse(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      87: {
+        name: "LSE",
+        fn: () => this.lse(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      67: {
+        name: "LSE",
+        fn: () => this.lse(this.readAddrZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      83: {
+        name: "LSE",
+        fn: () => this.lse(this.readAddrZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // RRA
+      111: {
+        name: "RRA",
+        fn: () => this.rra(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      127: {
+        name: "RRA",
+        fn: () => this.rra(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      123: {
+        name: "RRA",
+        fn: () => this.rra(this.readAddrAbsoluteY),
+        mode: "absoluteY"
+      },
+      103: {
+        name: "RRA",
+        fn: () => this.rra(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      119: {
+        name: "RRA",
+        fn: () => this.rra(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      99: {
+        name: "RRA",
+        fn: () => this.rra(this.readAddrZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      115: {
+        name: "RRA",
+        fn: () => this.rra(this.readAddrZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // AXS
+      143: {
+        name: "AXS",
+        fn: () => this.axs(this.writeAbsolute),
+        mode: "absolute"
+      },
+      135: {
+        name: "AXS",
+        fn: () => this.axs(this.writeZeroPage),
+        mode: "zeroPage"
+      },
+      151: {
+        name: "AXS",
+        fn: () => this.axs(this.writeZeroPageY),
+        mode: "zeroPageY"
+      },
+      131: {
+        name: "AXS",
+        fn: () => this.axs(this.writeZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      // LAX
+      175: {
+        name: "LAX",
+        fn: () => this.lax(this.readAbsolute),
+        mode: "absolute"
+      },
+      191: {
+        name: "LAX",
+        fn: () => this.lax(this.readAbsoluteY),
+        mode: "absoluteY"
+      },
+      167: {
+        name: "LAX",
+        fn: () => this.lax(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      183: {
+        name: "LAX",
+        fn: () => this.lax(this.readZeroPageY),
+        mode: "zeroPageY"
+      },
+      163: {
+        name: "LAX",
+        fn: () => this.lax(this.readZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      179: {
+        name: "LAX",
+        fn: () => this.lax(this.readZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // DCM
+      207: {
+        name: "DCM",
+        fn: () => this.dcm(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      223: {
+        name: "DCM",
+        fn: () => this.dcm(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      219: {
+        name: "DCM",
+        fn: () => this.dcm(this.readAddrAbsoluteY),
+        mode: "absoluteY"
+      },
+      199: {
+        name: "DCM",
+        fn: () => this.dcm(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      215: {
+        name: "DCM",
+        fn: () => this.dcm(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      195: {
+        name: "DCM",
+        fn: () => this.dcm(this.readAddrZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      211: {
+        name: "DCM",
+        fn: () => this.dcm(this.readAddrZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // INS
+      239: {
+        name: "INS",
+        fn: () => this.ins(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      255: {
+        name: "INS",
+        fn: () => this.ins(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      251: {
+        name: "INS",
+        fn: () => this.ins(this.readAddrAbsoluteY),
+        mode: "absoluteY"
+      },
+      231: {
+        name: "INS",
+        fn: () => this.ins(this.readAddrZeroPage),
+        mode: "zeroPage"
+      },
+      247: {
+        name: "INS",
+        fn: () => this.ins(this.readAddrZeroPageX),
+        mode: "zeroPageX"
+      },
+      227: {
+        name: "INS",
+        fn: () => this.ins(this.readAddrZeroPageXIndirect),
+        mode: "zeroPageXIndirect"
+      },
+      243: {
+        name: "INS",
+        fn: () => this.ins(this.readAddrZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // ALR
+      75: {
+        name: "ALR",
+        fn: () => this.alr(this.readImmediate),
+        mode: "immediate"
+      },
+      // ARR
+      107: {
+        name: "ARR",
+        fn: () => this.arr(this.readImmediate),
+        mode: "immediate"
+      },
+      // XAA
+      139: {
+        name: "XAA",
+        fn: () => this.xaa(this.readImmediate),
+        mode: "immediate"
+      },
+      // OAL
+      171: {
+        name: "OAL",
+        fn: () => this.oal(this.readImmediate),
+        mode: "immediate"
+      },
+      // SAX
+      203: {
+        name: "SAX",
+        fn: () => this.sax(this.readImmediate),
+        mode: "immediate"
+      },
+      // NOP
+      26: {
+        name: "NOP",
+        fn: () => this.nop(this.implied),
+        mode: "implied"
+      },
+      58: {
+        name: "NOP",
+        fn: () => this.nop(this.implied),
+        mode: "implied"
+      },
+      90: {
+        name: "NOP",
+        fn: () => this.nop(this.implied),
+        mode: "implied"
+      },
+      122: {
+        name: "NOP",
+        fn: () => this.nop(this.implied),
+        mode: "implied"
+      },
+      218: {
+        name: "NOP",
+        fn: () => this.nop(this.implied),
+        mode: "implied"
+      },
+      250: {
+        name: "NOP",
+        fn: () => this.nop(this.implied),
+        mode: "implied"
+      },
+      // SKB
+      128: {
+        name: "SKB",
+        fn: () => this.skp(this.readImmediate),
+        mode: "immediate"
+      },
+      130: {
+        name: "SKB",
+        fn: () => this.skp(this.readImmediate),
+        mode: "immediate"
+      },
+      137: {
+        name: "SKB",
+        fn: () => this.skp(this.readImmediate),
+        mode: "immediate"
+      },
+      194: {
+        name: "SKB",
+        fn: () => this.skp(this.readImmediate),
+        mode: "immediate"
+      },
+      226: {
+        name: "SKB",
+        fn: () => this.skp(this.readImmediate),
+        mode: "immediate"
+      },
+      4: {
+        name: "SKB",
+        fn: () => this.skp(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      20: {
+        name: "SKB",
+        fn: () => this.skp(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      52: {
+        name: "SKB",
+        fn: () => this.skp(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      68: {
+        name: "SKB",
+        fn: () => this.skp(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      84: {
+        name: "SKB",
+        fn: () => this.skp(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      100: {
+        name: "SKB",
+        fn: () => this.skp(this.readZeroPage),
+        mode: "zeroPage"
+      },
+      116: {
+        name: "SKB",
+        fn: () => this.skp(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      212: {
+        name: "SKB",
+        fn: () => this.skp(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      244: {
+        name: "SKB",
+        fn: () => this.skp(this.readZeroPageX),
+        mode: "zeroPageX"
+      },
+      // SKW
+      12: {
+        name: "SKW",
+        fn: () => this.skp(this.readAddrAbsolute),
+        mode: "absolute"
+      },
+      28: {
+        name: "SKW",
+        fn: () => this.skp(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      60: {
+        name: "SKW",
+        fn: () => this.skp(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      92: {
+        name: "SKW",
+        fn: () => this.skp(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      124: {
+        name: "SKW",
+        fn: () => this.skp(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      220: {
+        name: "SKW",
+        fn: () => this.skp(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      252: {
+        name: "SKW",
+        fn: () => this.skp(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      // HLT
+      2: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      18: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      34: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      50: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      66: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      82: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      98: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      114: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      146: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      178: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      210: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      242: {
+        name: "HLT",
+        fn: () => this.hlt(this.readNopImplied),
+        mode: "implied"
+      },
+      // TAS
+      155: {
+        name: "TAS",
+        fn: () => this.tas(this.readAddrAbsoluteY),
+        mode: "absoluteY"
+      },
+      // SAY
+      156: {
+        name: "SAY",
+        fn: () => this.say(this.readAddrAbsoluteX),
+        mode: "absoluteX"
+      },
+      // XAS
+      158: {
+        name: "XAS",
+        fn: () => this.xas(this.readAddrAbsoluteY),
+        mode: "absoluteY"
+      },
+      // AXA
+      159: {
+        name: "AXA",
+        fn: () => this.axa(this.readAddrAbsoluteY),
+        mode: "absoluteY"
+      },
+      147: {
+        name: "AXA",
+        fn: () => this.axa(this.readAddrZeroPageIndirectY),
+        mode: "zeroPageIndirectY"
+      },
+      // ANC
+      43: {
+        name: "ANC",
+        fn: () => this.anc(this.readImmediate),
+        mode: "immediate"
+      },
+      11: {
+        name: "ANC",
+        fn: () => this.anc(this.readImmediate),
+        mode: "immediate"
+      },
+      // LAS
+      187: {
+        name: "LAS",
+        fn: () => this.las(this.readAbsoluteY),
+        mode: "absoluteY"
+      },
+      // SBC
+      235: {
+        name: "SBC",
+        fn: () => this.sbc(this.readImmediate),
+        mode: "immediate"
+      }
+    };
+    /**
+     * Table of Rockwell 65C02 specific instructions
+     */
+    OPS_ROCKWELL_65C02 = {
+      203: {
+        name: "NOP",
+        fn: () => this.nop(this.implied),
+        mode: "implied"
+      },
+      219: {
+        name: "NOP",
+        fn: () => this.nop(this.readZeroPageX),
+        mode: "immediate"
+      }
+    };
+    /**
+     * Table of WDC 65C02 specific instructions
+     */
+    OPS_WDC_65C02 = {
+      203: { name: "WAI", fn: () => this.wai(), mode: "implied" },
+      219: { name: "STP", fn: () => this.stp(), mode: "implied" }
+    };
+  };
+
+  // src/data.js
+  var program = "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LKmhSCDgAiAv+yBY/CCE/miNAASgAJiZAL/I0PrOIQKtIQKqLDDA6urqyQiw5o3zA430A63/AkpKSkoJwOkASKn/SGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAArYHArYHAoACp0IQAhQGxAJEAyND55gHQ9a2AwGAAAAABoACpIKJAhACFAZiRAMjQ++YBytD2LFLALFfALFTALFDApiuGCOrqoADq6rlQCOrqSaXq6plgAOrqyNDv6uqi/+rq6prq6mDdr/0/EkSHMSObIJ8DmyPlBaUAnyGZIJgDrYULpWCldVyFC6VgpHVQhQulYKd1UBgpZbVejyCaGClltV6AmjSZbXVJq6VlGClltV5gpnUYQ5hj5XV/xRgpZbVexQdxI6VNI6RNI6dNI6YMoQ/FWo+MFFrtj6ykL+xabLUPTawPT1oHpe1vdVkHqhhVoTilpG91Uj/FvcygjKLMpKVPTW9Nb01vbS1tLW0WpfqlWqaloVouW6Japlr6////////////////////3////////////////////9/////////////////////f////////////////////3////////////////////9/////////////////////f////////////////////3////////////////////9////////////////////f////////////////////3////////////////////9/////////////////////f////////////////////3////////////////////9/////////////////////f////////////////////3///////////f/////////9//////////3//////////f/////////9//////////3//////////f/////////9//////////3//////////f/////////9//////////3//////////f/////////9//////////3//////////f////////////////////v////////////////////7////////////////////+/////////////////////v////////////////////7////////////////////+/////////////////////v////////////////////7/////////////////////f////////////////////3////////////////////9/////////////////////f////////////////////3////////////////////9/////////////////////f////////////////////3///////////////////9/////////////////////f////////////////////3////////////////////9/////////////////////f////////////////////3////////////////////9/////////////////////f//////////9//////////3//////////f/////////9//////////3//////////f/////////9//////////3//////////f/////////9//////////3//////////f/v///////9//////////3//////////f/////////9////////////////////+/////////////////////v////////////////////7////////////////////+/////////////////////v////////////////////7////////////////////+/////////////////////v////////////////////9/////////////////////f////////////////////3////////////////////9/////////////////////f////////////////////3////////////////////9/////////////////////f///////////////////3////////////////////9/////////////////////f////////////////////3////////////////////9/////////////////////f////////////////////3////////////////////9///////////3//////////f/////////9//////////3//////////f/////////9//////////3//////////f/////////9//////////3//////////f/////////9//////////3//////////f/////////9//////////3////////////////////7////////////////////+/////////////////////v////////////////////7////////////////////+/////////////////////v////////////////////7////////////////////+/EoUYhRyUI6gAEaCVGIUclCOoABGglRiFHJQjqAARqNAYhRyUI6gABpQMhRGo0BiFHJQjqAAGlAyFEajQGIUclCOoAAaUDIURqNAYhRyUI6gABISg1YKQgIGo1YCEEajQGIUclCOoAASUoNWClICFqNWAhRGolBiFHJQjqAAE1aDVgtWglajVoJURqJWAhaiAqIWogKjUgpSowILAqgAE1YKUoNWg1YCFqJURqJWghaqBqoWqgarUipSo0IrQqgAE1YqUqNWg1YKFqpURqJWghaqAqoWqgarUipSo0IrQqgAElKqUqpSAxYrFioURqNSowYrEgsWCxYqUqJSolKiUqAAElKjVipSAharVgoURqNCowILFgsWCxYKUqJSolKiUqAAEkKDVgpSAhajVgIURqNCowILFgsWCxYKUqJSolKiUqAAE0IDVgIWAlKCVoIERqNCowILFgsWqwYKUqJSolKiUqAAE0AiFgJQNoIERqNCowILFgsWqwYKUqJSolKiUqAAE0AiFgJQNoIERqNCowILFgsWqwIKUqJSolKiUqAAE0AiFgJQNoIERqNCowILFgsWCwIKUqJSolKiUqAAE0AiFipQNoIERqNCowIDFgsWCxIKUqJSolKiUqAAEwIKAoIGK0A2oEajQqICAxYLFgsWClKiUqJSolKgABMCCgKCBitANqBGolaiAqoGqgarBgtCK0IqUqNCKAATAgoCg0arRDagRqJWogKqBqoGqwYLQitCKlKjQigAEwIKAoNGq0Q2oEaiFqICogKiAqMCCwILAgpSowIIABarVotGq0ajVigAFqtWCgYqQqNWKAAWq1YKFipSo1YoAB4qVipWKE6CFF6CBAAeK1KqFihOohReogQAHitCqgYoTqIUXqNEAB6jAqsCCE6oXqtAAB6gKwIITiheK0AAHqArAghOKF4rQAAeoCsCCE4oXitAAB6gKwIITiheK0AAHoIGA0BOKF4rQAAeggYDQE6iAqMCq1IKFipSggaDBigAHoIGA0BOogKrBqtSChYqUqIWowaoAB6CBgNATqICqwarUgoWKlKiFqNGqAAjVqpUTqMGChYrQgIWKlIqUqtCggQAI1aqVE6DBgoWK0ICFipSClIrQoIEACNWqlROgxYKFitCAhYqUgJSK0KCBABTFgoWK0ICFipSglYrQqgAUxYKFitCAhYqUqJWK0KoAFMWChYrQgIWKlKiVitCKABTFgoWK0ICFipSKlIrQABTFgoWK0ICFipSKlIrQgIEAE6DFgoWK0IKFipSKlIrQoIEAE6qBqoGKwIrUqoWohYrAqgATqoGqgYrAitSqhaiFisCqABOqgKiAioCK0KCBoIGKgIoAAAAAAAAAAAAAAA3QigAN0KgXwIIADdCoF8CCAA3QqNCClaCVqIGq0IrUggAN0IqUoNGogIrFosGChQAN0ICUoNGogIrFosGChQAN0ICUoJWgharBosGC1AAN0ICUoIGAlIrAosGCwIIADdCAlKCBgJSKwKLBgsCCAA3QgJSAlaiFqMGigYrVAAAAAAAAAAAAAADA/58JwP+fEf7//58A4P+/CeD/vxH///+/AID/vwr/vxH8//+/AID/vwr/vxH8//+/AID/vwr/vxH+//+/AMD/vwr/nxH+//+/AMD/vwr/nxH+//+/AMD/nwr/nxH+//+/AMD/n4Dw//+D+P//n/j//4CA/7/8n/j//L/8//j/8P/z/4D//5/+n74AwP+fgPz//4f8//+f/P//gYD/v/if/P/5//j//v/h//v/wP//n/+/vwDg/5+A/P//h/7//4/+//+BgP+/+J/w//n/+P/+/+H/+//h//+//P+/AOD/n4D+//+H////j/7//4GA/7/4n/D/+f/4////4f///+H//7/8/78A4P+PgP7//4f///+P////gYD/n/yf8P/4v/j////h////8f//v/7/nwDg/4+A/v//x////4////+BwP+f/I/w//y/+P///+H////w//+//v+fAPD/j4D+///H////x////4HA/5/+j/D//L/4////4f////D//5/+/58A8P+PgP///+f////H////gcD///+P8P/8v/j////h////8P//n/7/jwDw/4eA/4f/5//h/8f/w/+BwP///4/4v/y/+P/8//D/+f/4/+Gf/r8A8P+HgP/H/+P/4f/n/+H/geD///+H+L/8n/z//P/w//j/+P/wn/+fAPD/h4D/x//j//H/5//h/4Dg////gfi//p/8v/z/8P/4v/j/8I//nwD4/4fA/8P/8//x/+P///+A4P///4D4v/6f/L/8//D/+L/4//+P/48A+P+HwP/D//P/8P/z////gOD//7+A+J/+n/y//L/4//y//P//j/+PAPj/g8D/w//z//D/8///v4Dg//+/gPyf/o/8v/y/+L/8v/z//8//jwD4/4PA/+P/+f/w//P//7+A8P//v4D8n/6P/r/+v/i//J/8///H/48A+P+D4P/h//n/+P/5/4OAgPD///+A/J//j/6f/r/4v/yf/L+AwP+HAPz/g+D/4f/5v/j/+f+BgIDw////gPyf/4/+n/6f+L/+n/6/gMD/hwD8/4Hg/+H/+b/4//n/gYCA8P/7/4H+j/+P/p/+n/y//p/+n4DA/4cA/P+B5P/x//i/+P/5/4CQgPj/8/+B/s//h/+f/5/8n/6f/p+A4v+HAPz/geb/8f/4v/z/+f+BmID4//P/gf7P/4f/j/+f/J/+j/6/gOP/gwD+///3////+P////z//5+A+P/z/5P+//+H/4//j/yf/o/+///j/4MA/v//9/////z////8//+fgPj/8/+f////h/+P/4/+n/+P/v//4/+DAP7///P////8/////P//j4D4/+H/n////4P/j/+P/o//j////+P/gwD+///z//+//P////z//4+A/P/h/5/////D/8f/j/6P/4f////z/4EA/v//8///v/z//7/8//+PgPz/4f+P////w//H/4/+j/+H////8f+BAP7///P//7/8//+//P//j4D8/+H/z////8P/x/+H/s//h/7///H/gQD+///x//+//P/+v/j//4eA/P/B/8/////D/8f/h//H/4f+///x/4EA/v//4f//n/i//r/4//+HgPz/wf/H/+//w//H/4f/x/+H/v//8f+BAP7//+H//5/4v/7/8f//h4D8/8P/x//n/8//3/+f/5//n/z///D/hwD8///A//+P8J/8/+D//4OA8P+B/4f/5//H/8//j/6P/4/4/7/w/4MAAAAAAAAAAAAAABKqgQASioUAEoqFABKKhQASqsGigQASisWigQASisWigQASisWigQASisWigQASqoGqgQAUoIEAFKCBABSqAAAAAAAAAAAAAAALoNUU0KoAC6DBghSUGaDBggALoMGCFJQY0KDBggALoMGCFJQY0KDBggALoMGCFJQZoMGCAAugwYLVoMGC1YLQitCq0KjFqoEAC6DBosGiwaLBgoColKLRoMGChQALoMGiwaLBosGCgKiUotGgwYKFAAugwaLBosGiwYKAqJSi0aDBgoUAC6DBosGiwaLBgoColKLRoMGChQALoMGiwaLBosGCgKiUotGgwYKFAAug1YDVgNWA1YLUipSi0YDFgoUAEsCCABLAggASwIIAEtUAAAAAAAAAAAAAAAAAAAuwnoP4gRPAgbDAgYDjw4ePAAuYs4aMgxPAgbDAgYCz5syZAAuMg4yMFbDwh4Cz5oyYAAuMg4yM4OPHmc7x8cOBgLPGh44AC4yDjIyw5syZw5mzxoGA4+eMmAALjIOMjLDmzJnDmbPGgYCD5oyYAAuYs4aMs+bMmcOZs8aBgIPmzJkAC7Ceg/jh44efw/GzhoeA48OHjwAQ4ICYFYMAEOCAmBWDABDggI+A8IEAAAAAAAAAAACAgICAgICAgAAAAAAAAAAAgICAgICAgIAAAAAAAAAAAICAgICAgICAAAAAAAAAAACAgICAgICAgCgoKCgoKCgoqKioqKioqKgoKCgoKCgoKKioqKioqKioKCgoKCgoKCioqKioqKioqCgoKCgoKCgoqKioqKioqKhQUFBQUFBQUNDQ0NDQ0NDQUFBQUFBQUFDQ0NDQ0NDQ0FBQUFBQUFBQ0NDQ0NDQ0NBQUFBQUFBQUNDQ0NDQ0NDQAAQIDBAUGBwABAgMEBQYHAEFCQ0RFRkdAQUJDREVGR0CBgoOEhYaHgIGCg4SFhoeAwcLDxMXGx8DBwsPExcbHwAECAwQFBgcAAQIDBAUGBwBBQkNERUZHQEFCQ0RFRkdAgYKDhIWGh4CBgoOEhYaHgMHCw8TFxsfAwcLDxMXGx8ABAgMEBQYHAAECAwQFBgcAQUJDREVGR0BBQkNERUZHQIGCg4SFhoeAgYKDhIWGh4DBwsPExcbHwMHCw8TFxsfABw4VHCMqMTg/Bg0UGyIpAgICAgICAgICAgJCQkJCQkKCgoKCgoKCgoKCwsLCwsLAAUKDxQZHiMoLTI3PEFGS1BVWl9kaW5zeH2ChwALFiEsN0JNWGNueYSPmqW1AAECBAUHCAoLDA4PERIUFRYYGRscHh8gIiMlJgADBgIFAQQAAwYCBQEEAAMGAgUBBAADBgIFAQQAAAAAAQEBAgICAgMDAwQEBAQFBQUGBgYGBwcHCAgICAkJCQoKCgoLCwsMDAwMDQ0NDg4ODg8PDxAQEBARERESEhISExMTFBQUFBUVFRYWFhYXFxcYGBgYGRkZGhoaGhsbGxwcHBwdHR0eHh4eHx8fICAgICEhISIiIiIjIyMkJCQkJSUlJiYmJicnJwACBAYBAwUAAgQGAQMFAAIEBgEDBQACBAYBAwUAAgQGAQMFAAIEBgEDBQACBAYBAwUAAgQGAQMFAAIEBgEDBQACBAYBAwUAAgQGAQMFAAIEBgEDBQACBAYBAwUAAgQGAQMFAAIEBgEDBQACBAYBAwUAAgQGAQMFAAIEBgEDBQACBAYBAwUAAgQGAQMFASBY/CCT/iCJ/qAAuTQI8A4g8P3JjdAEqQmFJMjQ7aYrnYjAikpKSkoJwI0zCCAM/UwAxo2NjY2NjY3Mz8TFoNLVzs7F0qDEwdTBoMTJ08u6ja2tra2tra2tra2tra2tra2tra2tra2NjcTJ08vF1NTFoNfJzMygzs/UoMLPz9SNjaDJztPF0tSgzsXXoMTJ08ugwc7EjaDIydSgwaDLxdmg1M+g0sXCz8/UjY2goKCgoKCgoKCgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANLM0AYAAxB1oKCgBQACgSWgoKACAAF0JaCgoAEAAFQloKCgAQAAGXWgoKABAAAVAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADMz8TFoNLVzs7F0v//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////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AIAhAQCAAYEAAAEBAAABAQCAIQEAgAGBAAABAQAAAQEAgCEBAIABgQEAAQEAAAEBAIAhAQCAAYEAAAEBAAABAQCAIQEAgAGBAQABAQAAAQEAgCEBAIABgQAAAQEAAAEBAIABCQAAAREAgAEBAAABAQCAAQkAAAERAIABgQAAAQEAgAEJAAABEQCAAQEAAAEBAIABCQAAAREAgAGBAAABAQCAAQkAAAERAIABgQAAAQEAgAEJAAABEQCAAYEAAAEBAIABCQAAAREAgAGBAAABAQCAAQkAAAERAIABgQAAAQEAAAEBAAABAQAAAQEAAAEBAAABAQAAAQEAAAGBAAABAQAAAQEAAAEBAAABAQAAAQEAAAEBAAABAQAAAYEAAAEBAAABAQAAAQEAAAGBAAABAQAAAQEAAAEBAAABgQAAAQEAAAEBAAABAQAAAYEAAAEBAAABAQAAAQEAAAGBAAABAQAAAQkAAAEBAABBCQAAAQEAAAEBAAABAQAAQQkAAAEBAAABCQAAAQEAAEEJAAABAQAAAQkAAAEBAABBCQAAAQEAAAEJAAABAQAAQQkAAAEBAAABCQAAAQEAAEEJAAABAQAAAQkAAAEBAABBCQAAAQEAAAEJAAABAQAAQQkAAAEBAIAhAQCAAYEAAAEBAAABAQCAIQEAgAGBAAABAQAAAQEAgCEBAIABgQAAAQEAAAEBAIAhAQCAAYEAAAEBAAABAQCAIQEAgAGBAAABAQAAAQEAgCEBAIABgQAAAQEAAAEBAIAhAQCAAYEAAAEBAAABAQCAIQEAgAGBAAABAQAAAQEAgAEJAAABEQCAAQEAAAEBAIABCQAAAREAgAGBAAABAQCAAQkAAAERAIABgQAAAQEAgAEJAAABEQCAAYEAAAEBAIABCQAAAREAgAEBAAABAQCAAQkAAAERAIABgQAAAQEAgAEJAAABEQCAAYEAAAEBAIABCQAAAREAgAGBAAABAQAAAQEAAAEBAAABAQAAAQEAAAEBAAABAQAAAYEAAAEBAAABAQAAAQEAAAGBAAABAQAAAQEAAAEBAAABgQAAAQEAAAEBAAABAQAAAQEAAAEBAAABAQAAAQEAAAGBAAABAQAAAQEAAAEBAAABgQAAAQEAAAEBAAABAQAAAYEAAAEBAAABAQAAAQEAAEEJAAABAQAAAQkAAAEBAABBCQAAAQEAAAEJAAABAQAAQQkAAAEBAAABAQAAAQEAAEEJAAABAQAAAQEAAAEBAABBCQAAAQEAAAEJAAABAQAAQQkAAAEBAAABCQAAAQEAAEEJAAABAQAAAQkAAAEBAABBCQAAAQEAgCEBAIABgQAAAQEAAAEBAIAhAQCAAYEAAAEBAAABAQCAIQEAgAGBAAABAQAAAQEAgCEBAIABgQAAAQEAAAEBAIAhAQCAAYEAAAEBAAABAQCAIQEAgAGBAAABAQAAAQEAgCEBAIABgQAAAQEAAAEBAIAhAQCAAYEBAAEBAAABAQCAAQkAAAERAIABgQAAAQEAgAEJAAABEQCAAYEAAAEBAIABCQAAAREAgAGBAAABAQCAAQkAAAERAIABgQAAAQEAgAEJAAABEQCAAYEAAAEBAIABCQAAAREAgAGBAAABAQCAAQkAAAERAIABgQAAAQEAgAEJAAABEQCAAYEAAAEBAAABAQAAAQEAAAGBAAABAQAAAQEAAAEBAAABgQAAAQEAAAEBAAABAQAAAYEAAAEBAAABAQAAAQEAAAGBAAABAQAAAQEAAAEBAAABgQAAAQEAAAEBAAABAQAAAYEAAAEBAAABAQAAAQEAAAGBAAABAQAAAQEAAAEBAAABgQAAAQEAAAEJAAABAQAAQQkAAAEBAAABCQAAAQEAAEEJAAABAQAAAQkAAAEBAABBCQAAAQEAAAEJAAABAQAAQQkAAAEBAAABCQAAAQEAAEEJAAABAQAAAQkAAAEBAABBCQAAAQEAAAEJAAABAQAAQQkAAAEBAAABCQAAAQEAAEEJAAABAQCAIQEAgAGBAAABAQAAAQEAgCEBAIABgQAAAQEAAAEBAIAhAQCAAYEAAAEBAAABAQCAIQEAgAGBAAABAQAAAQEAgCEBAIABgQAAAQEAAAEBAIAhAQCAAYEBAAEBAAABAQCAIQEAgAGBAQABAQAAAQEAgCEBAIABgQAAAQEAAAEBAIABCQAAAREAgAGBAAABAQCAAQkAAAERAIABgQAAAQEAgAEJAAABEQCAAYEAAAEBAIABCQAAAREAgAEBAAABAQCAAQkAAAERAIABgQAAAQEAgAEJAAABEQCAAYEAAAEBAIABCQAAAREAgAGBAAABAQCAAQkAAAERAIABAQAAAQEAAAEBAAABAQAAAYEAAAEBAAABAQAAAQEAAAGBAAABAQAAAQEAAAEBAAABgQAAAQEAAAEBAAABAQAAAQEAAAEBAAABAQAAAQEAAAGBAAABAQAAAQEAAAEBAAABgQAAAQEAAAEBAAABAQAAAYEAAAEBAAABAQAAAQEAAAEBAAABAQAAAQkAAAEBAABBCQAAAQEAAAEJAAABAQAAQQkAAAEBAAABCQAAAQEAAEEJAAABAQAAAQkAAAEBAABBCQAAAQEAAAEJAAABAQAAQQkAAAEBAAABCQAAAQEAAEEJAAABAQAAAQkAAAEBAABBCQAAAQEAAAEJAAABAQAAQQkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWTGYCVQFmAjYYVQFEAWYUNg0wF2AIZgMWFmYENiMyAWIBVQFmIBYHZgI2JTAUYA4QERYlEAgWIxAGYAIwDzYXZgIWB1UBZh4WOEQBFgVEARYHRAE2B1UBNgRVARYDVQEWAzYLVQEWAzYORAFmAWAMMClgAkQBFisQBGAFMAE2ZzIBRAFmKzYMMBU2ElUBFgNVATYFVQEWAzYIZgIWShAEYAcwCTYVZgoWDUQBZgIWBEQBFgJEBhYERAEWAmIVNjFmAWIEEgZEAWY3NgEwHWAzNjJmAxYBEBtgBTYoRAFmHzYURAFVAWYtNgEwEmAlZgFVARYNZgI2CTAKNgREATYDRAE2AxYiRAEWB0QEFgNEARYnEg4WHlUBZhk2ATADYAcQH2AHMAk2M2YEEAkWCBIBYgwyATYyRAEWC0QBFglEARAsYAQwAzYKRAEWBUQBNgNEATYDRAFmAzYDVQE2CFUBZkwWCRAVRAEQLxYJEgMWEmYCNgZmLVUBFgMQHFUBFgNEATYDMhU2CzALYAxEAWINEgIWDUQBZiA2BDAXNh5EATYvMAhgAxAiFhtmJlUHFgNVAWYdFgIQhWACMAM2AzIPNgMwDDYgZgEWCmAGZgI2CDAFYAJmAhYIEAFgBmYBNggwBGADZgEWCBACYAMwATYIMANgAxYJEAJgAzADNgcwA2ACEAIWCBABYAIwAjYKMAJgAhADFgQQA2AFMAI2B2YWNgJmM1UBNgVVATYEVQE2A1UBNgNVAWapYgxmB2APVQFmGBYqVQEWA2YBYAdmAzYDMBs2CEQBZhg2D2YIRAFmODAOZhFgBGZJNwMAAAAAADADAAAAAAAzBwAAAAAAMAMAAAAAADcDAAAAAAAwAwAAAAAAMwcAAAAAADADAAAAAAA3AwAAAAAAMAMAAAAAADMHAAAAAAAwAwAAAAAANwMAAAAAADADAAAACQAzBwAAAAAAMAMAMBERERERERERAwAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADR1aCkscOztY359OHi7OWgxdHVoKSxw7WxjeL59OHi7OWgxdHVoKSxw7ayjeLp9OHi7OWgxdHVoKSxw7fFjfji+fTh4uzloMXR1aCkscO5wY344un04eLs5aDF0dWgpLHEsraN4u/v9KDF0dWgpLHEwrKN8+Pv8uXi9eagxdHVoKSxxrCwjePo4fLk4fThoMXR1aCkwcSwsI2N8vf08/Dh8u2gxdHVoKTCt8W4jfL39PP27+ztoMXR1aCkwrfFwo3y9/Tz9PLj66DF0dWgpMK3xcON8vf08/Pl4/SgxdHVoKTCt8XEjfL39PPi9ebmoMXR1aCkwrfGsI3y9/Tz4+3uBgAABwAABwAABgAAAwYTEREREREREREDAAADBgMAAAAAAAAHAENERAN2ERERETERERERAQAAExERERERMwAAAAAAAAADABERETFDREREAwAAAAMAcXARMwAAAAgDcAAIA3ARETEDAAATESEiERETEQAAMAAAAAMAAAAAAAMAAAAwAAAAAwAAAAAAAwAAADgAcABDREREREQDcBMREREREQNwAABwABMRAwAAAAAAAxEREREBAwADAAAAAAADAAAAAAADAAMAAHAAAAMAkHAAAAMAEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABERYRERERERERERARERBgBhAURERAQAAAAAABAWYWABcQAQEwAAAACAEAYREQERERETEREHMRERYQAAR0QRERMRERExAREREREBAAEQExEQETEBEQAAAIAAABATERABMXEQExERERNzEBMREAExEREDAAAAExERExEHATEREAMAAAAAERETEREBMREXAwAAAAEAAAMAAAAwABATERMRMSEhISEhITEhIRMRExExERERABERMSEhAwADADAREREBEBExAAATERERMREREREHERERMZMAAAAwcBAREQGAAAAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAAAAAAAAAAAIAHADAAAAAAAAAAAHAIE4EHMAAAAAAAAABwGDEDEAEwERE2ERExABABMAMAAAAAADMHADAAAAAwAwAAAAAANwMAMAAAADADAAAAAAAzBwAAAAAAMAMAAAAAADcDAAAAAAAwAwAAAAAAMwcAAAAAADADAAAAAAA3AwAAAAAAMAMAAAAAADMHAAAAAAAwAwAAAAAANwMAAAAAADADAAAAAAAzBwAAAAAAMAMAAAAAADcDAAAAAAAwAwAAAAkAMwcAAAAAADADADAREREREREREQMAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIEEgYiFDIIQiRSFmI0cgqCRJImolSyGMJk0jbidPIMAoQSRiKUMihCpFJWYrRyGoLEkmai1LI4wuTSduL08g4CBBKGIhQySEIkUpZiNHIqgkSSpqJUsljCZNK24nTyHAKEEsYilDJoQqRS1mK0cjqCxJLmotSyeMLk0vbi9PKpqampqampqampqampqampqampqampqampqampqampqamqqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmqqauqq6mrqqupq6qrqauqq6mrqqupq6qrqauqq6mrqquprKqsqayqrKmsqqyprKqsqayqrKmsqqyprKqsqayqrAAEBhQIJBY0CkQmVBhkNnQMhEaUKKRWtBrEZtQ45Hb0DgSGFEgkljQqRKZUWGS2dByExpRopNa0OsTm1Hjk9vQQBAYUiCQWNEpEJlSYZDZ0LIRGlKikVrRaxGbUuOR29B4EhhTIJJY0akSmVNhktnQ8hMaU6KTWtHrE5tT45Pb0qampqampqampqampqampqampqampqampqampqampqampqqmqqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmrqqupq6qrqauqq6mrqqupq6qrqauqq6mrqqupq6qrqayqrKmsqqyprKqsqayqrKmsqqyprKqsqayqrKmsqqwABggWCiYYNgxGKFYaZjh2DoZIliqmWLYcxmjWOuZ49hAGiBZKJpg2LEaoVlpmuHYehsiWaqbYtjzG6NZ65vj2IAYIFoomGDZMRihWmmY4di6GSJaqpli2XMZo1rrmePYwBogWyiaYNmxGqFbaZrh2PobIluqm2LZ8xujW+ub49qmpqampqampqampqampqampqampqampqampqampqampqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmqqaqpq6qrqauqq6mrqqupq6qrqauqq6mrqqupq6qrqauqq6msqqyprKqsqayqrKmsqqyprKqsqayqrKmsqqyprKqsAAgKGAwoGjgOSCpYHGg6eBCISpgsqFq4Hshq2DzoevggCIoYTCiaOC5IqlhcaLp4MIjKmGyo2rg+yOrYfOj6+EAIChiMKBo4TkgqWJxoOnhQiEqYrKhauF7Iati86Hr4YAiKGMwomjhuSKpY3Gi6eHCIypjsqNq4fsjq2Pzo+vipqampqampqampqampqampqampqampqampqampqampqamqqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmqqauqq6mrqqupq6qrqauqq6mrqqupq6qrqauqq6mrqquprKqsqayqrKmsqqyprKqsqayqrKmsqqyprKqsqayqrAAKDBoOKhw6EEosWh5qPHogikyaLqpcujDKbNo+6nz6QAqMGk4qnDpQSqxaXmq8emCKzJpuqty6cMrs2n7q/PqACgwajiocOpBKLFqeajx6oIpMmq6qXLqwymzavup8+sAKjBrOKpw60EqsWt5qvHrgisya7qrcuvDK7Nr+6vz6qampqampqampqampqampqampqampqampqampqampqampqqmqqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmrqqupq6qrqauqq6mrqqupq6qrqauqq6mrqqupq6qrqayqrKmsqqyprKqsqayqrKmsqqyprKqsqayqrKmsqqwADA4cECwePCBMLlwwbD58QIxOnFCsXrxgzG7ccOx+/IAMjhyQLJ48oEyuXLBsvnzAjM6c0KzevODM7tzw7P78AAwOHBAsHjwgTC5cMGw+fECMTpxQrF68YMxu3HDsfvyADI4ckCyePKBMrlywbL58wIzOnNCs3rzgzO7c8Oz+/Kmpqampqampqampqampqampqampqampqampqampqampqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmqqaqpqqmqqaqqq6qrqquqq6qrqquqq6qrqquqq6qrqquqq6qrqquqq6qsqqyqrKqsqqyqrKqsqqyqrKqsqqyqrKqsqqyqrKqsAA4QHiAuMD5ATlBeYG5wfoCOkJ6grrC+wM7Q3uDu8P4ADhAeIC4wPkBOUF5gbnB+gI6QnqCusL7AztDe4O7w/gAOEB4gLjA+QE5QXmBucH6AjpCeoK6wvsDO0N7g7vD+AA4QHiAuMD5ATlBeYG5wfoCOkJ6grrC+wM7Q3uDu8P6pqampqampqampqampqampqampqampqampqampqampqaqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6usrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrICAgYCCgISAiICQgKCAwICAgYOAhoCMgJiAsIDggMCBgIKFgIqAlICogNCAoIHAgoCDh4COgJyAuIDwgOCBwIOAhImAkoCkgMiAkIGggsCEgIWLgJaArIDYgLCB4ILAhYCGjYCagLSA6IDQgaCDwIaAh4+AnoC8gPiA8IHgg8CHgIiRgKKAxICIgZCCoITAiICJk4CmgMyAmIGwguCEwImAipWAqoDUgKiB0IKghcCKgIuXgK6A3IC4gfCC4IXAi4CMmYCygOSAyIGQg6CGwIyAjZuAtoDsgNiBsIPghsCNgI6dgLqA9IDogdCDoIfAjoCPn4C+gPyA+IHwg+CHwI+AkKGAwoCEgYiCkISgiMCQgJGjgMaAjIGYgrCE4IjAkYCSpYDKgJSBqILQhKCJwJKAk6eAzoCcgbiC8ITgicCTgJSpgNKApIHIgpCFoIrAlICVq4DWgKyB2IKwheCKwJWAlq2A2oC0geiC0IWgi8CWgJevgN6AvIH4gvCF4IvAl4CYsYDigMSBiIOQhqCMwJiAmbOA5oDMgZiDsIbgjMCZgJq1gOqA1IGog9CGoI3AmoCbt4DugNyBuIPwhuCNwJuAnLmA8oDkgciDkIegjsCcgJ27gPaA7IHYg7CH4I7AnYCevYD6gPSB6IPQh6CPwJ6An7+A/oD8gfiD8Ifgj8CfgKDBgIKBhIKIhJCIoJDAoIChw4CGgYyCmISwiOCQwKGAosWAioGUgqiE0IigkcCigKPHgI6BnIK4hPCI4JHAo4CkyYCSgaSCyISQiaCSwKSApcuAloGsgtiEsIngksClgKbNgJqBtILohNCJoJPApoCnz4CegbyC+ITwieCTwKeAqNGAooHEgoiFkIqglMCogKnTgKaBzIKYhbCK4JTAqYCq1YCqgdSCqIXQiqCVwKqAq9eAroHcgriF8IrglcCrgKzZgLKB5ILIhZCLoJbArICt24C2geyC2IWwi+CWwK2Art2AuoH0guiF0Iugl8CugK/fgL6B/IL4hfCL4JfAr4Cw4YDCgYSDiIaQjKCYwLCAseOAxoGMg5iGsIzgmMCxgLLlgMqBlIOohtCMoJnAsoCz54DOgZyDuIbwjOCZwLOAtOmA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";
+  var levelData = "AAAAAAAAAAAABgAAAAAAAAcAAAAAAAAGAAAAABERETEREREBAAYAAAAAAAAAMEREREREBgBwAAAAAAAwAAARAwARERExEQAAADAAABEDAAAAADAAAACAMAAAEQMAAACHMAARExERAAARERERExEREQADAAAAAAAAAAADAAAAAAMAAAAAAAgAAAMAAAARERERMRERERERAwAAAAAAAAAwAAAAAAADAAAAAAAAcDBERERERAMABwAAABMREQEAAAAAERERMQAAAwAAAAAJcAAAAAAwEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABwAAAAAAAAAAAAAAAwIxIiAwAAAAAABwAAADADAAADADARERERMXAAMAMHCAMAMAAAAAAwERE1ExISAwAwAAAAADAAAGADAABDRDREREQAOAAAYAMAAAMAMAAAMBEhIiIyAwAAAwAwAAcwAAAAADADAAgDBzARETEAAAAAMBIREiERMgAAAAAwETEREhECAAAwAAAAADAAMAByAAIAADAAQERENAAwcBERERETESIiAAAwABERAAAAAAMAAAAAADAAAAAAAAAAAwAJAAAAMAAAABERERERERERERERERER/////////////////////////////////////////wAAAAAAAAAAAAAAAAAAYEREREREAAAHAAAAAABgAwcAADAREREREQMAAGARETEAMAAAAAAAIyIiIgAAMIAwAABwAAADAAAAAAAwERERExEREwEAAAAABzAAAAADAAADQAQAABEREwAAAAOAAAMAQAQAAAADADARERETAQAAQHQAAENENAAAAAOAAAAAEAAAAwAAABMRERERAwAAAAADAAAAExEREREDAAARMRERERERAHAAEBERExExEREREREwETEQERETADAAAAAJADARMQBwAAMREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAABGREREREQAAAAAAAAAAAMAAAMAAAEHAQAAAwAAAwcwMwAHEREBBzAzAAcDMwADMAMAAAAzAAMwAwMDMzMDAwAAAAMzMwMDAwNweAADAAMAA3B4AAMDMBERMQAwMwAwERExAAMAMzMDMwADMAMzMwMAAwAAAAADMzMDAwAAAAADAHAAAANweAADAAAHABMRETEAMBERMQATERERAwAAMAAAMzMDAAMAAAADAAAwAAAAAAAAAwAAAAMAADAAAABwAAkDAAAAEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAGAAAABwAAAACAARAQAAYAAAABERExEREQARAABgAAAQAQADAAAAABABAGAAABEAAAMAAACHEBEAYAAXEQAAAwAHABETEQFgABERExETERERAAMAEWAQAQADAAAAAAAAcwgQMREAAAMAAAcAABMRAwAwAAAQEzERAQAAAwADAAAAAAAAMAAAAAADAAMAcAAAgAAwAAAAAAMAExERERMRETERETERAwAAAAAAAwAAAAAAMAADAAAAAAADkAAAAAAwABERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAREREREREREREWEREREQEHAAAAAAAAABaAcAAQURExEREDAAcAFhERERNRETEREREREREREBEAEwEAMAAHCAAAEREQEQATMRERERExERERERARABMxABARETEREXEXEBEHEzEAEBERMRERERERERETMQAQAAA3AAAHgABwEBMxABARExERERMRERETEzEAFxEDAAAAExERERMTMREVAAMAkAADEAEAExMxERUTERETERERcQcTEzERFRMRERMREXERERETMQgAE3ERAwBwAAgAABMREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAABgAAAAAAAAAARERERAAGAAAAAIAAAAADAAAwERExAQAQExEAgAMAcDAAADAAAAADABARExEREQAIMABwAAMAAAADAAAAERExEREAAwAAAAMAAAAAADAAAAADAAAAAwAAAAAHMABwAAMAAAADAAAAERMRERERETEAAAMRETAAAwAAAAAAMHAAAxERMAADcAAAAAAwREQDARcwERERMQAAAAAAAAMRETEAAAAwAAAAAAAAAwAAMAAAADCQAAAAAAcDgAAwEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAABgAAAAAAAAAAAABgAAAGAAAAAAAAcIAAMGEAABYDAAgHABMREUM0YQAAFkM0ERExEwAQAwBhAAAWADABADETABADAGEAABYAMAEAMRNwEAMAYQAAFgAwAQcxExERAwBhAAAWADARETETABADAGEAABYAMAEAMRMAEENEMRERE0Q0AQAxEwAQADAxAAATAwABADETeBAAMDEAhxMDAAGHMRNREQAwISIiEgMAERUxAwAABTAAAAAAA1AAADADAABQOAAACQADBQAAMBERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAAAAEZEREREREREREREREREE4AAEAAAAAAAABAAABADEREBAAAAAAAAABERAQMBEQEAAAAAAAAAcREBAxERAQgAgAAAAAgREQEDEQFREREREREREREBAQMREVERARcBFxERETEBAxERURERERERERERMQEDERFRERERERERERExAQMREVEREQAAERERETEBAxERURERAAARERERMQEDERFREREAcBMRERExAQMAAAAAABERQ0RERDQAAwAAAAAgIgIAAAAAAAADAACQACIiAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHAAAAAAAAYAAAAAAAExEREQAHAABgAAAABwADAAAQEREBAGAAEREREREDAAAAAAcAYAAAAAAAABMREWERETERAAgAAAAAAwAAYAAAMAAAEREREREDAABggAAwAHARERERERMREREiADARERERERERAwAAAAAAMAAAEREREREDAAAAB0Q0AAARAAAAEQMAAAARADAAABEAdwARAwAABwAAMAAAERERERExERERMQAwAAAAAAAAADAAAAAQERERMQAABwCQMAAAAAAAAAAwERERERERERERERERERH/////////////////////////////////////////AAAAADAAAAAAAAAAAAAAgAcAMAAAAAAAAAAAcAgTgQcwAAAAAAAAAHAYMQMQATARETYRETEAEAEwAwAAAAAAMwcAMAAAADADAAAAAAA3AwAwAAAAMAMAAAAAADMHAAAAAAAwAwAAAAAANwMAAAAAADADAAAAAAAzBwAAAAAAMAMAAAAAADcDAAAAAAAwAwAAAAAAMwcAAAAAADADAAAAAAA3AwAAAAAAMAMAAAAAADMHAAAAAAAwAwAAAAAANwMAAAAAADADAAAACQAzBwAAAAAAMAMAMBERERERERERAwAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHAAAHAAAAAAADABMREREREREREQMAAAMAAwAAAAAAAAcAQ0REA3ARERERMREREREBAAATEREREREzAAAAAAAAAAMAERERMUNEREQDAAAAAwBxcBEzAAAACANwAAgDcBERMQMAABMRISIRERMRAAAwAAAAAwAAAAAAAwAAADAAAAADAAAAAAADAAAAOABwAENERERERANwExERERERA3AAAHAAExEDAAAAAAADEREREQEDAAMAAAAAAAMAAAAAAAMAAwAAcAAAAwCQcAAAAwAREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAACAAAA1NTU1NTU1NTU1NTU1ZTU1NTU1NTU1NTU1NTVlNzEwMTcxMDE3MTAxN2E1MTUxNTE1MTUxNTE1YTUxNTE1MTUxNTE1MTVhNTE1MTUxNTE1MTUxNWEwMTcxMDE3MTAxNzEwYTUxNTE1MTUxNTE1MTVhNTE1MTUxNTE1MTUxNWE3MDAwMDAwMDAwMDAwYRMRERERERERERERERFhAwAAAAAHCAcABwgAAGAjIiIiIiIiIiIiIiIiYnMAAACQAAAAAAAAAABnEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAAgAQACANAAAQwBwQAMANAQABEAwBAADBDAEA0AwQAAABDBAAANAMAcDBDAABEAAMAB0AwA0AEMANABABAAwB0ADADBDAEAwBEAEQDBERERAAAMEADQAdEAAMAAEAAMEQ0AAMEc0AAQwAABAA0ADBAQwRDAAQDAAAAQDQENwQDgEMEAANARAAANAAzQABAAwAEAAQAAAA0BDMABAADAABAQABAADQAM0QAAEMEcAQABAAANHQzAAQEAwBARwBAAEAwQDNAAEADQAAEBAQEBDAAAwAABwAABwCQAAAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAAAYAYAAAcIcAAAcAAIBwBgZmYRERERAwATERERYWYAAAAAAAADAAMAAAAAAAAAADARERERERExAAAAB4AANwAAcHAAADAHCHARERExcHAREXFwMBEREQAAADAQEQEAEREwAAAAAAAHMAAAAAcAADBwAAAAExERERERERERERExAAADAAAAAAAJAAAAADAAAAMHAHATERERcwBwMAAREREREQMAAAATEREREQAAAAAAAwAAAAMAAAAAAAcAAAADAAAAAwAAcAAhISEhISEhISEhISEhIQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAACQAABgBQEREzERERMzMDAABgAAAAADAAEAADAAAAAAYAAAcAAAMTAAMAAABgAAAAcQAAMBMAAwAAAAYAABARBwAAEwADAABgAAAAERFxAAATAAMAAAYAABEREREAABMAAwAAYAAAcBERAQAAEwADAAAABgAAEBEAAAATAAMAAABgAAAAAQAAABMAAwAAAAAGAAAAgAAAEwADAAgAAGAwERERERERERURERERYBARERERERERAAAAADBhEREREREREREAcHd3NxEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAABgBgAAAAAAAAAAAAAAAGAGAAAAAAgAAAAAAAAAYBMRFRERERERERERERExExEVERERERERERERETEDAAcAEUREREQRAAAAMAMAAAAXAwCAcBEAAAgwAxARABEDEREREQARETEDEBcAEQMAAAARABEXMQMACQARAwAAABEAERExAxARABEREREzEQARFzEDEBEAERERETMRABERMQMQEQARAAAAAxEAAAAwAxARABEAAHADEQAABzARERERERMRERERExEREREREQFwExERAQcTERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAABgAAAABwAAAAAHAABwUzEAABMRAwAAExETADEDEBERAQATEREDAANwMHOAAAAAAAMAAAMAEREwUxERAAAAABAREwAAADADEhEBAAAAEQAAAAATMAMSEREAABABAAAAEwMwAxIREREREQAABwADABEDEhERERERABARAAMAAAMCABAREBEAAAAAAwB4AwJwEAEHEQAAgAADABEDMhERERERMREREQMAEQMwAAAAAAAwAAAAAwARAzAAAACQAAAAAAADABEREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEzEAAAAAAAAAAAAAAHgTMYcAAAAAAAAAAAAAExERMQAAAAAAAAAAAHATERExBwAAAAAAAAAAExERERExAAAAAAAAAHgTERERETGHAAAAAAAAExERERERETEAAAAAAHADAHd3d3cAMAcAAAAAExERERERERERMQAAAHATERERERERERExBwAAExERERERERERERExAAATERERERERERERETEAAAMAAAAAAAAAAAAAMAAAAwAAAAAAAAAAAAAwAAADAAAAAJAAAAAAADAAEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAHAAAAAAAAAAAAAAAQERERMQCAcAAAAACAcAAAAAAwMRERMQAAcBERMQAAADAwAAAwEVERAQAwRERENDAHADAAAAAAADAAAAAwEBEREXAAAAAAMAAAADAAAAAAETERERExAAAAMEREREQHMACAADAAAAcwAAAAcBEREREBEBERETEAABERAAAAcABwAAAAMAAAAAARETERURExAAcwAHAAAAAAMAAAABARERERERExAAAwAAAAAAAAAAAAADAAADBwAJAAAAAHAAAAMBERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAiIiIiIiIiIiIiIiIiFkNERERERERERERENGYWAzAAABABgABwAAAwdhADMBAREREREREREREREwMwEBEAAAAAAAAHAAATAzAAEBAREREREREREREDMAATAHAAAQcBBwEHEAMwABMxERERERERERERAzBEAzAREQEREQEAABADMAADMAAAARcAAIAAEAMwAAMwRAMREUMUERERAzAAAzAAAwAAAxAREREDMAADMABDNAADEBEREQMwAAMwAAMwEBMRcHcQAzAJAzCAAzAAExETEREREREREREREREDdxMREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcAAABwAAAAAAAAB3EREREREREREDAAAAABEAAAAAAAdwAAMAAAAAAAAAADARERERA3AAcAAAAAAAMAAAAAATERERAQAAB3gwAAAAAAAAAAAAADARERFDREQEAAAHAAAAMAAAAAMAADARERERMXAwAAAAAwAAMAAAAAAwETEAAAgDgHAwAAAAcDAAAAATERMRETEAABMREQAAAENEREQEAHAAAwAAAAAHcwAAADAREREDAAcRERExAAAAMAAAABMREQAAADAAAAAwAAAAAAAAAAAAMAAHkDAAAAAHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgIiIiIgAAAAAAYAAAAAIAAAAAAgAAAABgIAIgAHAHCAAQAwAAAGAgAiIRExERESEyAAAIYCcCEhETERERERETISIxIiISMTNBREREMTNBRDRENBIxMAFwAAAxMAEHAHAwEjEwAZAAADEwAQAAADASMTcRERMRMTchAAAAMhIRERERExERERERERExAgAAEDEzEQAHAHAAcDBCREQUMzBDRERERERENAIHABADAAMAAAAAAIAwAgAAAAMAAxARERERETAiIgAAAwADEQEXAXAQMRIRESFzcAMQERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAABgBgAAAAAAAAAAAAAAAGYAAAAAAAAAAAAAAABgBgAAAAAAAAAAAAAAAGYAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAABMxAAAAAAAAAAAAAAAAEzEHAAAAAAAAAAAAMBERETEACAAAAAAQA4AwAQcHMRATAwAAAAARMRERERERERMRAwAAABABBxARAQcAcwARAwAAABERA3AQEQMTMRADAAAAEBcTEQMHA3MxFwMAAAgAERERERERERERAwkiIiIiIiIiIiIiIiIiIgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAACAAACAAAAACYAAAIAAAIAAAIABwAAJgAAUhERAgAAEhEBEBEmEQEAAAAAETEIcAAAcCYRERERETEAMBEREREQIwAAAJAAMBAxAQAHABAjMRERERExcDEBERExECNBREREFDEQMQEBADAQIwEQAAEXMQAwAwERMRAjARAAARAzERETcRExECMBEHABEBMAAAABETEAIwEQEQEQExARAQEAMDEjMREAETMTEBcBERERMSAxACASMxEAEAARBwAwITEAIAAwERURURERETEhMREBADAAAIAAAAAAMCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAACAAAAAAAAAAAAAAAYTERERETEACHAAAHAABgMAAAAAMBERMQAQERMRAwcAAHAwAAAyAAAAAwADARAREDBwBzIAAAgDAAMBEQEQMCACEhEREREiAwEQERAwIAIAAAAAAHIDAREBEDAgREREBHAAMgNxEBEQMCAHAAAQETEyAxERARAwIAIAAAAAMDADERERETAgAgBwAAAwEQMAAAAAMCACERERADAAIyIiIhIiIgIAAAAAMAADAAAAAAAACQAAAAAwABERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAAAYAYAAJAAAAAAAAAIAABgBgASE0JEREREJDEhAGAGAHIDAgcAAHAgMCAAYAYSAQMRAgAAIBEwFyFgZnIAA3ACBwAncDAQJ2ZiEQEDABECIBERMRAQJgIAAAMAAAInBwAwEAAnAgAAExERMiERADcQASECBwgDAAgwAAAQMQAAIDIREQMAEjERIQAwABAjMAIHAwABMHAQADAAKAMwEgEDEQEwABARMBAhAzBwAgMCADAAACcwIAcDMAAQEQAAMAAAABEBAAMREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAABERERERARgAAAAAAAAAAAHAHAgA2BwAAAAAAAAERERESEiIiIDcCMDAAAhISEhIiIAICIiIgMAAAAAAAAAIgAHAAAgA3gARERERAMiERExACASETEAAAAAAyIAADAIABARMQAAAAADIhARERExEBExcAAABwMiEAAAADEQETERgQABAyIQAHAAMRBxMREREQEDIhARERExEAExAAAAAAMAEAAHADEAADERERERERERMBEDERERMQAAAAAACQAwcAMAAAAwEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIREAAAAAAAACAAAAAEREAAwAEAAAAABEDAAAREQADEUAAgABAEQMAAHEXAAMRBBEREQFAAwAAEREAAwAAERERAQMTEQAAAABDRAAREREBAxAXAAAABAAAAxEREQEDEBEAAAAQEQEDEXcXAQMAAAAAQBARAQMREREBAwAAABFBEHcBQwAAQEADAAAAcQEQEQEDBAAEAxARAQARAQAAAAMACQADEBEBAAAAAAAAAxARAAMQdwEAABABAAADEBcAAxARAQAAEAEAAAMQFQADAAAAAAAAAAAAAwAAAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAYAIAAHd3CAgIAACQAABgEhERERFRERERERERETEAAAAAAAAAAAAAAAAAMAAAAgdwAAAAcAAAACcwAAASERERFRERERURITAAAAAAAAAAAAAAAAAAMAAAAAJwAAAHAAAHIAAwAAAAEhEVERFREREhADAAAAAAAAAAAAAAAAAAMAAAACAABwAABwBwAgAwAAAAIhERERERERECADAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAAAAAwd3cAgAAAAAAACAAAIzARERERESIiIhERESEiMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAABgAAAAAAAAAAcAAAAAAGAGAAAAAABwMTBEREREREZEREREAxMRM4AAAAAAAAAAAAczERExMEREREBEREREAxMREREzcAAAAAAAAAAzERERETUwREREQEREg1MRERERFTMAAAAAAAczUREREREVMTBEBEREAxNRERERERURM3AAAAAzEVERERERFRExMERAAxMRUREREREVEREzAAAzERFRERERERURETEAABMREVERERERFREREZM3ERERUREREREIAAAAEzEAAAAAEREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEWEREQAAAABAREQECAAAYEAEgAAAAAAAACIiMgAwARARERMREUFEABAwExEBEEdEQ0REAQARERMDAAAQEQEAETEBAHEAAwMAABBERENENAEAQQADAxkAEHNxczE3AQABAHMxEQAQEREREREBABETETAAABcAAHAAAAEAAAMAMAAAEQAQEQMAAQAAAwAwABcQAAAAAwBxABMRETAAARAAcAADABEAAwAAMBcAEDAREREDAXEDAAAwAXAQMAFwEAMAEAMAABERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAREWEREREREREREQEREQAAYQFEREQEAAAAAAAQFmFgAXEAEBMAAAAAgBAGEREBERERExERBzEREWEAAEdEERETERERMQERERERAQABEBMREBExAREAAACAAAAQExEQATFxEBMRERETcxATERABMRERAwAAABMRERMRBwExERADAAAAABERExERATERFwMAAAABAAADAAAAMAAQExETETEhISEhISExISETERMRMREREQARETEhIQMAAwAwERERARARMQAAExERETERERERBxERETGTAAAAMHAQEREBgAAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQERERHQXERFxR0RERAQDAAAAFxEzMxFxAAAAMAMAAHARM4M4MxEHAAAwAwAAEDEDAAAwEwEAADADAAAXMwAAAAAzcQAAMAMAABFzAAAAADcRAAAwAwAAMXMAAAAANxMAADADAAAxdwAAAAB3EwAAMAMAADFzAAAAADcTAAAwAwAAEXMAAAAANxEAADADAAAQMwcAAHAzAQAAMAMAABA1cwdwN1MBAAAwAwAAABUzczczUQAAADADAAAAEBEzMxEBAAAAMJMAAAAIEBERAYAAAAAwERERETEAAAAAExEREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAABABAAAAAABgBgAAAAAAIAIAAAAAAGAGBwAAAAcQAXAAAABwYBISEhISEiMyISEhISEhAHAAAHAAEzEABwAABwAjISEhISEhEhISEhISMgMABwAHABABAHAAcAAwEhISEhISIzIhISEhISEAAIeABwATMQBwCHgAACMhISEhISESEhISEhIyA3AAAHAAEAEABwAABzASEhISEhIjMiEhISEhIQAHAAAABxMxcAAAAHAAIyEhISEhIRISEhISEjIDAAAAAACQAAAAAAAAMCEhISEhISEhISEhISEhAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcAcAAAcAAAAIAHABMRETERARERMREBERExAwAAMAAAAAAwAAAAADAwAAAAA0AAAAMAAAAAAwMAADAABAQAMAAAAAAwMAAAAEMAQAADRERERANDREQ0AAAABDAAAAAAMAAACABDAABAAwAAAAADERERMAAEAAQwAAB4cDAREBEAA0BAAAMAQBEhInAAcDAAAAQAMABAESEiERURAANAQAADAEARISIRFRAwAAQABDAAQBF3IgAHBwBDAABAAwBAIiIiERERMAAABwkwcAAiIiIREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAGAACAAAAAAAAAAAAAABYRERERISIiEiIiISIyBwAAAAAAAAAAAAADADARAAAAACAAcAAAR0QHMBERMRMzEREREQABAAEwAAAxAzMBIhERAACAADAAADFzMwECEREQERMRMQAAERERAXIRAQAAAwAwAAAAAAAAAAAAAAADADAAAACQAAAAEBMRESMiMhETERERMREBA3cAAwAwAAMAAAAwAAADIgAAEDEAE3EBADAAEQEiERERMAATEQEAOABwACIAAAAwERERERERERERIhERIiIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAABgBgAAAAAAAAAAAAAAAGARERETETEIOBERExEREUAAAAMAMDIyAAADAAAEAxERAQAAMABwABERETADEREBEDMzMxMAERERMAMRcQEQIyIiEwARFxEwAxERARAzMzMTABERETADAAAAAERERAQAAAAAMAMIAAMAACAAAAADAIAwIyIiAwBwInIAACMiIjIDAAADACAiIgAAAwAAMBMREQMAIiIiAgATERExAwAAAyciIiIiBwMAADAjIiIDIiIiIiICIyIiMgcAACMiIiIiIiIDkABwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARAWAQAQAQAQAQAQYQERERYBERgBERgBERBhERAxAxARAxARATARATATADADFEAzEAcBMwRBMAMAMYEXETETETETEXEQE5ExEAERMAMREAMREAETETAQAQcwAwAQA3AQAQMRMRABERMxERMxERABExAxAxARAxARATARATATADADEAADEAcBMAABMAMAMQETETETETETETEQEwExEAERMAMREAMREAETETAQAQAwAwAQAwAQAQMRMRABERMxERMxERABExAwBwAAAzcAAzAAAHADATERERERERERERERERMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAQEREREREREREGAAAAABAREREhQEREFAYAcAAwAQBwACADAQcQERERETESERERIAMREREAAAcAMAIAcAAgAxERERMRERERAhEVESADERERAwCABwACAABwIAMACAARERERMQIRVRUQERERMXAAAAAwAgBwAAAAAAAwExERERECERURAAAAADADcAAAAAIAAHAAAAAAMBERERExAhFVFQAREQEwAAAAADcCAABwAAFwATATEREREQIRFREAABMBMAMACAAAAAkAAAAAE3AwEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARAdERERESEREQEREADBwcQAAAABDEEADcHeXAxcQBwAAMAQRATQAdxFwAQBxAABDEAAQQANwgFAAARAAMAQRABABNIATARARACJCABB3FwBAMQMAAQABAAcAMxEBAAAwA0AQEQBwAzAREwAAADADAAQBADcAMHcDRERENAMAQABwAwAjIjIAAAAwIjIARDQAAHMAN0BERDQAMAAAAAAwERERAwAAMBExETEAADAHAHADREQ0AAAAMAAAIyIiIjIAADAAAAAwAAhzAIAAN0BENBEREREiIhIRERExAAAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABwAAAAcAAAAAcAAABxMRAAATEQAAExERERExAwcABwMAAAcDBwBwADATERMRAwARESEREhEhEQMAA4ADAEREREREREQEERETERExAAAABwCHADAAAAMAADAgEREiIiIRMQAAIyIiMCAAAAAHcAAwAQADcCAwIAAgIiIiIjBxJyIRITAgACAABwcgMBEhIhEhMCBwIDARESMwAAdwAAAwIFIiMAAAIzARERERATAgAAAwAIAjMAAHBwACMCARERERIiIwERERAyIiERECAAdwADkRERcDAAAAAAATEREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAABgATEREREREREREREREDAAMTAQAHAAcIBwARAwMAExETERERERERERMRAwADAwMRAQcAhxEDAwMDABETEQMTERERAxMREwEAAwMDAwMTEQMDAwMDAwATERMRAwMHAxMRExEDBwMDAwODIyKDAwMDA3MRERMRcyMjIiNzExETEREDAwMjIyMiIyMDAwMTERMBIyMjIyIjIyMDERMRAyMjIyMjIiMjIyMDExEjAwMDAwOQAwMDAyMTERERERERExcTEREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABERERERERERERERERFhAQAzMzMzMzMzMzMDAGEBCQMzAwAwADADAAMIYRERAzMDMzAwAwMzExFhAQADMwMzMDADAwADAGEBCAMzAzMwMAMDMwMIYRERAwADADAAMAMAExFhMzMzMzMzMzMzMzMzM2MDBwMHAwcwAAcDBwMHYzMzMzMzMzMzMzMzMzNjAwADAwMzMDADAwADAGMDAwMDAzAwAAMDMwMDYwMwAwMDAzAwAAMAAzBjAwMDAwMzMDADAzMDA2MDAwMAAzMwMAMDAAMDYzMzMzMzMzMzMzMzMzNjAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAiIiIiIiIiAmAgIiIiIgA4AAAAQ0QAYDAAAAAHImIRIiISFSJiMCIiMBJCNAAAADBERAMwABAREQIwAAAAcBAXgzAABwARBzUAAAAwAAASAyIRERISNURERDRERCRDREREI3EgAAAAMABwIyIAAAATIhUAAHc3AAAjREQABzMCAAAAADAAACMDBwAVMhFREQAAMJAAIwMAAAAwMUREMBIRElEiAwAAADAxBwAxAAAAABMDIBERMDFCFBEDAAAAIwMQcCAwMQARITEACAADAwAhEiISEREiIhERERERERESEQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcAAAAAAAAAAAAGAAAAAREQMAAAAAAIAAYAAAAAAHAwAAAAAwERERAwAHERERERMRETEAABAREREAAAAAAwAAMHAAAAAABwAAcAADAAAwERERERERMREREQMABzAAAAAAAAAwAHAAIyIiMgAAAAcAADEREREDAAAQERETERExAAAAAAMIAHAAAAMAADBwAAAAExETERERIiIiIhExEREBAANwAAAABwgAADAAAAAwERERERMREREAMERERDQAAAAAAwAAAAAwAAAAAJAAAAADAAAHERERERERERERERFhEREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAIiIiIiJiggAAAAAIAAACcCAAAGAiREREERExkAIjICMRYRIREQBwABEhAiMgIxFhAgAQEREBAAAAIyAjAGARMQAAABERAwcjICNwYAERITEAAAATESIgIxFhAXAAERIDAAMAICAjEWEREQEAEBESAwAgICMAYAEHIRMAABAhESMgI3dgEQEAEyESAAcgIyAjEWEBIREDABARIiEjICMRYQEAESERA3AAICMgIxBhARMBABcRIjEhIyAjAGEBEwAAAAAAMHAjAAMAZ3ETEhEhEREhESIREhERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHAAAAAAAAAEBEREQQETEJAAAAAAAAAwAAAABwMAAABwAAcAADAAAAMCIiEBERERMREQMAAAAwcAAAAAAAAwAAExERMRARMQAAAAADAAADAAAwAHAwOBERERERMQMAADAwIiIwIiIiIiIyAwBwEzAHADACAAAHADIDADABEBExMDIiIiIyMgNwEwAAADcwMgIABzAyAzABADAiIjAyIiIiIjIDEwAAMHAAMDIAAAcAMDMBAAAQETEwIiIiIiIiMwAIAAAAYDAAAAgAAAAREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAABAQAAAAARwAAcEAAQEAAQDBABAMBEREUBAAEBAAANAAAQwAAAAAAQAAAQAAwBEADAACABwAHAABwADAAQAMCIiMiIiIlIiIiJDAAAwAgcyAAAAAAAAAAIAADAycjIAAAAAAABwApBwMDJyMhMRERERMSEyERE0MnIyAwAACAAwETMAADAycjIDABABADARAwCHADJyMgMRARARMBEiERExMkREAxEBEBEwEQAAADAAAAADEXEXETABAABENxARAQMHF3FwMBEAEwAxEXcREREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMABAAAAAAAAAAAMEREAwAwAAAAAAAAAAAwIAADADAAAAAAAACAADAgdwMHMBERAAdwExERFRMREwEwABARERERAAAAM1EDADAAAAAAAAAAAAAwUwMAAENEREREREREREQzAwAAAwAAAAAAAAAAADADAAADBwAAAAgABwAANwMAABERMSIiIiIiERURQ0QAAAAwAAAAAABEBAAAgAcAADAAAAAAMAAAABERERExMABwAAAwBAAHAAAAABERMSIyEREQFxEHAAAACQAwADAAgBARERERERERETEAMBERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhIRIAAAAAAABgEiIRIREiEQAAAAAAAGAhEhEiACAhAXAAAAAHYCEAACATACAREhEyEQJgIRAyIBMCICESETIQAWcCEDIgEwEAABIhMgAhEQEXMiAjEQcAECIxAAAAABEyBxMSEQEAEjEAREREFCIxAyIhEQcQMnAAAAAQAjADAAATAQAiIRICABACMBIRIiMRAAAAAAAAFwIwISEiExJxAIAAABcRAjAAcAAjEhElIiJSESEyERMSESIAgAAAAACQADASIxEhABMhEiIREiIRIhIDAAcAAwAAAAAAgAAgIQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAAAAAAAAAAAAAAAAAAMAAAAAcAgAAAAEREAAdgAAAgIiIiIiIyAyAiIiIAAAAAAAAAADADAAAAAEREBEBERDAiIkNEREREAAAAAAMAMAAAAAAIAAAAAHAAEwAwAAAjIiIiIiIiIiISACAiMgMAAAAAAAAAAAAAAAAzAwAAcAAAAAcAAAggAAMiIhEiIgMhEiIiIiIAAwAAAAAAAwAAAAAAAAADAAAAcAADAABwAAAAAAMjIiIiIgIiIiIiAAAAAwMAAAAAAAAAAABEREQDAwAAAACQAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAIAAAAAAB2cAAAATERERERERATAREQAAAAMREREREREAExERExERARAXcREXATARERETERERAAAAAACAExERERMREREREREVEREREQAAExEREXFwAAAHFxERcAcTERERERURFREREREREQMAAAAIAAAAAHAREREAAzARETERETEANBERADcDMAADMAADMAAQEQA3EQMwd3M3d3M3ABAANxERAzARETERETEAADcREREDAAAAAAAAkAAwERERERMRERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAAAAAAEBEREREREQZwAABwAAAQEREREREREREREREREQNwAAAAAAARERERERERERERERERMQAAcIAAgHAAAAAAAAAwExEREREREREREREREREDAAAAcAAAAAAABwAAABERERERERERERERERExAAAHAAAAcAAAAAcAADATEREREREREREREREREQMAB4CAAAgAAAcAAAAAERERERERERERERERETEAcAAAAAcAAHAAAAAHMBMRERERERERERERERERAwAABwAAAAAAB5AAAAAREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAERERERERBhERERERERFBRERERAEGEEREREQUABAHMAAXAAYAcQADcAEAAHEwcAEABgAQBwMXAAAAEDcXAAAGAABxcwEAAAAAMQEAACYiIhETAAAAkAAxAQAAJgBwEBMACAARMTEREREVERERExERMQAwMIAAAAAAAAADAAAwEyExERERERERERMSERFDRDFBREREREQUEwAAAAMXMBAHAAAAcAEDAQAAcwE3B3EAAAAXAAMQAAATcDFxEAcwEQEAAwABBwMXMRczIRMSAAgDcBARERERETEAAxcREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHdHRHR3cHdERERERHR3EQEAEBETEQAAAAAAEBERAQAQERMRAAAAAAAQEREBABARExEAAHcHABAREQEAEBETEQAAEQEAEBERAQAQERMRAAARAQAQEREBABARExEAABEBABAREQEAEBETEQAAEQEAEBERAQAQERMRAAARAQAQERFxRBcRExFHdBFxRBcRERF3ERETEXEXERF3ERERERERERMRERERERERERAREREBAxEREQEREREBABEREQADEBERABAREQAAgAAAkAMAAAAAgAAAABERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABhEREREREREREREREREWFEREREREREREREREQQYSEiISIhIiESMiFEFBNhAQBwAAAHAAcwAHATE2E3IiIiIiIiIiIiIiMTYTFBRERERERERCRwExNhNwEiIiIiIiIiIhERE2ExAQJ3d3d3d3cAcHETYTcBEhEiIiIhIiITERNhMQEAAAgAAAAAAHNxE2E3ISIiIiIiESIiEyATYTFEREREREREREQAExNhIRIhMiIhITIiIiJzE2GAAAAwIAIAMAAIcBMTISIhESEiMiIhIRIhEhOQAAAAAAAwAAAAAAAAEwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEREREREREREREQEAABYBGUFEIAIABwAAAAAAFgEhAAcjEhERMQMTAwMWAQEAAAMAIBIwcwMDAxYBMREREnEAEDADAxMDFgExAQAAIBEAMAMDAwMWcTABAAcQEjABAwMDAxYRMxEVEhESMHFhERMDFhEDAACAAAAwUWEBAwMWERMhERERITMDYQEDAxYRAyEREREhMwBhAQODEwEDIAAHACADAGExExETATMhERERIQMHYTEIABMBMSEREREhIyJhEREAEwExAQAAByASAGAAEAATATcQIiIiIhKAYAAQEREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABABAcAAAAAdAAABwAAAAMQAQAAADAQAQARAwAAAwAAAHAIMAAAAAADcHBDBAAAEAE3AHgAADMREQMwhwAAEDEAEQBwMAAAcDARAAAAMAAAABEwAAARMAREeEQ0AAAAADAAAAcAMAARAAAHAEcAMAcQAQAwAAAAEAEQAXMTAQAABDcABwAAAAAAEwEAADAQMQARAHAAAAADAABwMAAAcAAAEXAAAHMAABMxAAARAAAAEAEAEwEAAwAAAAAAAAAAAAAAAAADAAAAAAAACQAAAAAAABERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEREAAAAAAAAAAAAREQDAAB4AAcAAABARDQAAAAIBxERETFARAMAAAAABxERAXAAMQMAAAAAeRARAQCHUTExA1BREAEREQAHUREBMTEDcHBwAAFwEFEBcAAxMQMRUFEAARERAHARMTExA3BwcAABAXAQFQUxMTEDEBFQAQEBERUABzExMQNwcHAAAQEBcBAxMTExA1FQEQABAQERETExMTEDcHBwAAEBAQEAMTExMQMQUVABAQEBAQcxMTExAwAAAIABAQERETExMTEREREREQEAAAAAMDAwMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAAAAAYAAAAAAAAAAHCAcAAgIwBAREREBAkAIxEhEiBzAAAAAAAREQAjAAAAICMAAAcAAAAAcCNERAAgIwAREUQEAAAwIwAAACcjAAcAAAAABzADcBIRIiMRAQAAMBERMCMhAgAgIwAAAHgwAQAwI0RERHQjABAREREBADAjAAAHICMAcAAAAAAHMCMAIBEhI0QREUQAEwEwIwcAACAjAAAAAAcDADAjEQAAICMAAAAREQEAMAMAAAgAAwAAAAAAAAAwEhESESEiEhESESESISIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABEWEWEREWEREWEREWERAXYIYAAAYABwYHAAYBAxERERERURUREREREREzFxAAAAgAcAAABwABATMRERUREREREVERERExMxAXAAAAAAAAcAABATEzExEREVEVEREVERExMTMTEBAAAAAAAAABATExMxMTFxAACAAABwEBMTEzExMRFRERURFRERExMTMTExAHAAAAAABwATExMxMRFRERERERERFRETEzExAHAAAAAAcAAAABMTMRFREREVEVEREREVERMxAIAAcAAACQAAB4AAExERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAABERERERERERERERERFhBwgAAAEAAAAHEHAAAGARMQExMREREREQExAxERExMTExAXAAEBATEDERETExATEBEREQEBMAMDBxMTExMTGREBAQExARMQEwMTExMREQEBATEAMwMDExMTExABcQEBMQExETETAxMRERERAQExADMBMBMTExcAAAEBADFBExA0AxMREREREREBMQAzATATExAAAAAAAQExATEUQBMRERERERERETEAMwAAAwAAAACAAAABMQETEREREREREREREREYAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYgAAAAAAAAAAAAAAACZiAHh3d3cHd3d3d4cAJiIiIiIiImIiIiIiIiIiAAAABwcAYAAAcAAHAAAAADIiIgBgACAjIiIAAAAAMAcHAGAAAHMABwAAACAiIjICYAAiIiIyAgAAAAAHNwBgAABwADcAAAAyIiIiImAgIyIiIiIAADAABwcAYAADcAAHAAAgIiIiIjJiIiIiIiIyAgAAAAdwMGAAAAcABzAAICMiIiIiYiIiIiIiIgIAAwAAAAAAAAAAAAAAAAADAAdwAAAACQcABwCAEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAREREAREREREQHAACABhEREQADAAAAMDFERABgEBERMQMAAABTUQM3BwAGEQAxQ0RERFNRAxExAGAQBzEDAAAAU1GDETEAAAYRMYMAAAAzMwMRMQAAYBAxQUREAFJTAhExAAAABjERBzAAUlMCADAAAABgNhFxMABSUwJDNEREREQ0ERE3AFJTAgMAAAAAAAARETEIUlMCQ0RENBEXEQAAMABSUwIDAAAjERERAAAwAFJTAgMAMBIREREAADAAkAMAAwAwEhERERERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARERExQ0REREQ0ExERERERETMAQAAABAAzERERERExAwAAgRgAADATERERETMAAAQREUAAADMRERExAwBAEBERAQQAMBMRETNERAQRERERQEREMxExAwBAEBFxFxEBBAAwEzMAAAAREREREREAAAAzMQMAQBARcRcRAQQAMBMRMwAABBERERFAAAAzERExAwBAEBERAQQAMBMREREzAAAEERFAAAAzERERETEDAEAAAAQAMBMRERERETMAAAAAAAAzERERERERMYMAkAAAOBMREREREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAGABAAgBAAAACAAIAAAEZERHQTAxETYRZmEQMAAwAAEAMxARNwARcAAwADCQAAARAwARMAAQADABERAQAQARMAARAAAAMAAAABABcwARcAAUQEAwAAEAAAATMDAQAQABERMXABABcAMRMAEQAFAAAwEQAAARcwARAAARAAADABABcAARMAAQAQAHEAMAAAARcwARcAEwBxEAAwABcAARMAAQADARAAATAAARcwARAAAAMQBwEQMBAAATMAAHAAAwABAAAxAAAAExERERERERERATAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACIiIiIiIiIiIiIiBgAgAgAAAAAIAAAAAAAGACACADAhESIxAgAAAAYAIAIAMAAAADYSEiESBgAgAhEyAAAwNgEBGERERCRyADAAcDYWAQESAAAAJwIAMAAwNhYAARAAAAAoMgAwADA2FnCREAAAACEyADAAMCYRABEQAABwITIiIhUiJgAAEBAAABAhMkBEREQkREQUEAAHACEyAABwAAMAABEQAAARITIAIyUiIyIxARAAcAEgMgAjACAjADERERUScCAyACMAICMHMQAAAAARIjJwI4AgIxERIRIREhEhAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADCBEAAAAAAERERERERBMREQAAABAxAAAAAAAAExERAAAAEDEQEhISEhITEREAAAAQMXBwcHBwcBNxEQAAABAxUVFRUVFRExERcAAIEDFRUVFRUVETERERERERMURERERERBMRERERERExACAgICAgA5CAAAAAADAAEBUVFRETERERMREREREDAAAVERMRERExABARERMRMRURExERETERBxARExExFRETERERMRERBxADCDAVEQAAAAAwERERABMRMRURAAAHBzARERERExExFREREREREREREREDdzAVEQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAACAdHdkAEdHAAAAAAAAADAXETc3AQFHAAAAAAAANxERMTEAAAEAAAAAAAcxERcxMAAAAEcAAAAAMTQRETEwAAAAAQAAAAc0ABcRBzAAAAAAAAAAMQAAAAAAMAAAAAAHAAAwAAB3dwAwAAAAAAEABzQAcBERBzAAAAAAAAAxAAAQETEFMAAAAABwBDAAABARUwEwAAAAABBwNAAAEDEVATAAAAAAABcwAAAQUxEBMAAJAAAAATCAADAVEQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAGAAAAAAAAgAAAAAAAAAYAAAAAADARETEAAHATETExCABwMAEAMQAAMRERMRERMRETERExETExAAAycAAyIAMgATEANzEQETIgATIgAycBMRAxMXARMgBwMiADAQExEDExEBEyEBAyIAMiADEQMTEAcDIgADAXAxEHMQg3MRERMRERMRUTERExETE3REREBHcwAAgRAAAgNyIyAAARIhIxInEAAHAyADARcSEiIjEiIiIjIjIJMHERd3d3MAcAAAMAMCIiIhERIiIiEhERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAAAAAYAAEBERERERERERBQRAwBwCAAAAAADAAAAABATURERAAAAAAMAAAAAEAMAABAAAAAAA4cDEXAQAwcDEHAAQEQTERMRERETEXMQERFwAAMAAwAAAAAAExERERFRAwADAABwAwATAXAQEVEDF0NERBETERMRERERURMRAwcDEQMAAEFEREREExdTEQMRczgAAQAABwATEQMAAxERMQABAAcRABMRAwADEQAwAAEHEQAAExEDAAMRADCQEREAAAcTEQOAAxEREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABmZmaWBgAAAAYAAAAACABgAABmAABghgIAADcHAGAAAGAGAGYgIgBwM3MAYAAAAGZgBiIiAjczMwdgAAAAYGYgIiIiMzMzQ2QAh3AARkQ0MwAAMAAAERERERERAAADAAAnBwABBwAAcBAAAAMAcCJyAAFEREREEAAAAwAgIiIAAQMAADAQAAADAAAiAgABAwAAMBAAAAMAExERA3EDAAgwFwAAAwADAAADERERERERAAADAAMAAAMwAAAAAAMAAAMAExERMxERERERETMRETEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAABgAAAAAAAgIiIiIiIiImIiIjJERAMAAAAAIAIAYAAAMJAAAwAIAAAgERExERERERERERERERERAzAAExEAABERAAAAETETERETERABERERERERMRERETARcAERAREAERAxAREBMREQAREBFxFwEDERcBAxEQAAEQERcBEQMRERETERERERURERERExAAFxMAMAAAAAAACAEzEREREBExERETERERETMXARAQADAAAQMQAAABMxAAAACAMABxAxAHAAExERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcABwAAAAAAAAAHAAcAAQMREAcABwAAAHEDERAAAwAAAQMREAEBMAMAAAAAMAAAAwAAAAAwAAAwAAMAAAAAADADAAADAAAACAAwB3ADAAAAMAAwAAADAAABEAA0REMAAwAAAAAwAAADAAAAADAAADAAAwQEREBAMAMAkAMEBERIADAAAAMAAAEQADAHcAMAAAAAADAAAAADAAEQADAAAAMAAAAAAACAMAADAAAAAAAwgAABERUVVVVVVVVVURERExAAAAAAAAAAAAAAAAADAREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEREREREREQEAAAAAAGABAAAAAAAAAQAAAAAAYAFEREREREQzERERcQBgAQAAAAAAABMABxAQRDRxcAgAAJAAEwAAEBAIMDEREREjIiISIgAwABEwMQAAEAMAABARADAAADAxBwAQQ0RERACAEAMAMDEAECEDAAAQERERAwATMQARJwMAEBEAABATERExAAEgA3ARF3AHEBMBETERACADEAEQERERExAQMXEAIAMRABBERBQTARExAAAwMwEAEAAHEBMXEDEAADAxAAAAAAAQEwEREREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBEBAAAcHd3dwAAQEQEAwAQEREREREREREBADADIhIRERERERERESEiMAMAEBERERERERERAQAwgzIQEREREREREREBIzgiMhAAAAEAEAAAEQEjIgAwEHd3cXcXd3cRAQMAADAQEREREREREREBAwAAMBAREREREREREQEDAAAwEBERERERERERAQMAADAQEQAAAQAQAAABAwAAMBARd3dxdxd3dwEDAAAwEBERERERERERAQMAADAQEREREREREREBAwAAMBAREREREREREQEDAAAwAAAAAAAAAAAAkAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAYQEAAHAACABERERERHRhERERERERMQMAgHAAE2EREQAAAAAwExERERERYBERAXAACDADAAAAEAFgERERERERMQNwAAARMWAREREBAAAwExEREQEwYABwABEABzADAAARUTFgExERERERMQMHEAEAMGATAQEREQAwExERcAAwYAMwMQEXATADEBERFTFgIjIwMREROQMRcAAAMGAiIjIwARExExERFRExYCIiIjIzATETAAAAADBgAAAAADAwMAMAAAAAMGAREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAAAAAAgAAAAAAAIAYACAcCMiIiAiIiIjAgBhMRERAwAAAEQEACMXMWExEREREwERABMIAxExYTERFwADEHEBAwETATBhMREREwAQEVEDEAMwEWExAAADAJAAAAMAATABYBARMRMREREBARcANzERERExExEREVEBARARMREAADATERERUQEAABcxABERERNxABBRQUQ0ATFEREQAEwEAF1ExABAAcQAAATETERERUTEAERERMRFxMQMAEQcAMBABAAAwABExExERERExEREREREBADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEREREREdAAAAAAAIiIiABABAAAhIiISAwBCREQEcAcAAAEAABADADIAAAARUQAAAQgAFwMAMncAAAdwAAAREREVAwAiIgMHUREAAAAAADgDAAAAAwAAAAcABwBIBAMAAAADAAAhIiIiIkEEAwAAAHMIB4EAAHAAAQADAAAAExExERERFREBAAMAAAAQADEAAAAAAAAAAwAAABAAMQAAAAAAAAADAAAAEHcxAAAAAAAAAAMAAAAQUTEAAAAAAAAAAwAAAAAAMAAACJAAAAADABEhIiIRISISESIiESEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAAIiIiMgAAAAAAAAAwIiIAAAAwAIAAAAAAgDAAAAAAADAREREhIhERMQAAABAAMAAAAAAAAAAwAAAAAUA0AAAAAAAAADAAAAABBzcAABcHAAB3NwAAAAFxMUQAAQF3BxExRAAQAHExB0d0AREBcTEHRxAAETFxARcHdwcRMXEBEAAAMRcHEQERAXExFwcBAAAxcQEAAAAAETFxAQAAADA0AAAAAAAAMDQAAAAAMAAACQAAAAAwAAARISIRERERISISEREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIiIiIiIiYCAiIiIiIiJCRERENCFkJDFEREREJAIAAHAwQWREMXAAAAAgAgAHEDFEZ0c0EQAHACACcBFFMyFhITFDUQEHIAIXQTQURWNDFTREEXEgcRFEQ0REY0NERENEESdRRDRERERjQ0RENEREFUFEg0RERGNDRESEQ0QUAQATERFRk1MREREDABABBwMAAAARAQAAAANwEAMAAwCAAHEBgAAAAwAwQ0QTFRERAxMRERVDRDQDBzAAAAADAwAAMAAHMAMAMAAHAAMDcAAwAAAwERERESEREREhERERIiIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBEdAAAAAAAAAAAB5dhAAAQAwAAAAAAADAREWEAABADAAAAAAAAUxERYQAAEAMAAAAAADBREQBhAAAQAwAAAAAAE1ERB2FwgBADAAAAADBxURFVYRERADEAAAAAEzBREQBhBwBxEHMAADABN1ERAGERMRAAEQMAExExUREAYQcQA3EQczgBBzdREQBhEQMxEAARExERMVERAGEHMRADcRADBwc0UREAYTEQAzEQEBMRETBREVVhEAMxEAMAAAAAMFERAGAAAzAAAwAACAAwAAAAYBERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAABgAACAAAABcHAAAAAAAWBwARETERERERExMRERERMQcAMXAAAAATAwAQAAAwETERETERERERERMTEREHMAAAMAAIAAAAEwMAcDERERERERERExERERERNxEHEAAAABcDAIAQBwARERERMRERERExEREREREDAAA4EXEQATAAEQAXERMRMRERERExETEREREHExExARcRETcRMQAAERETETERERERMRERERMREQMAMQAAEJAwAAEAA3AREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhwAAAAAAAAAAAAcAARERETcAAAAAAAEBEVEQEAABMRERUAAAAQAAAAAQAAEwAAEAAAABCABwABAAATAAAQABAREREBB3EAMRERcRcAEAAAABFRERExAABREREQAAAAAQAABzGABwBAEBAAAAABADAREREREQETEABwcAEAMAEAAAAABxMQABERAQAwAQcwMTARERARAQABFxMRATARUQEAAAABBxERAwABNwEAAAAAABERARADABFRAQAAAAAAAAAAAAMAAJAAAAAAEhISEhISEhISEhISEhIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAABgRkRERERERERERERERGQzAAAAAAAAAAAAAAAAMwMQFQEAEBEVARAREQEwAxAAEQAQAAABEAAABTADEAAQARAAAAAQAAAAMAMQAAABEAAAABAAAAAwAxAAcAEQAAAHEAAAADADEAAQARAAEAEQAAAHMAMQBxEAEABwARAHcAEwAxARAQAQERUBEFERATADAACQAAAAAAAAAAAAMAMTEREBEBERARATEQEwAxMAcAEQERExEBNxATCDEwAAARgBFzEAExEBMBERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAAAMAcAcAMAAHADAAA3AABwAwAwBwAAMAcAAHMAADAHAHADAABwAwAANwAAcAMAMAcAADAHAABzAAAwBwBwAwAAcAMAADcAAHADADAHAAAwBwAAcwAAMAcAcAMAAHADAAA3AABwAwAwBwAAMAcAAHMAADAHAHADAABwAwAANwAAcAMAMAcAADAHAABzAAAwBwBwAwAAcAMAADcAAHADADAHAAAwBwAAcwAAOQcAcAMAAHgDAAg3AAgREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQERERBQAAAAAAAgAAAADAAAAEAAHADAREQMBMQNVVVUQEREjMAIAAwExA1VVVRAAByMwMgIDATEDVVVVEBMRITAyAgMBMQNVd1UQAwcgMDICAwExA1VVVRARESMwMgIDATEDVVVVEAAHIzAyAgNxMQMAAAAYExEhMDICAxE1ExEREREDByAwMgIDADATERERERERIxEyEhERMRMRERERAAcjIjIiIhExE3EXERETESFwYHAgFzETERERcSMhIiIiIiIRMSMiIiIiAgAAAAeABwAwAwkAAAAwEREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGIhIiESIREiISASIhESMmZmJiYhEiZmZmYiEREykHAmBncHBgaAYHAAFjISEiYWEiETIxExEREWMnAAJgZ3BwMDFzERIRYyEmImBhEBAwMiNxdxFjJmBicGAABzAxAyEiIWMgAWIQZwACMDcDBERBYyB2ggBhEBIwMQMgAnETIRESMGEABzAxAwEHEWMgACI2ZmZiMDEDAAICMyAAJDRERERHMYMHJ3EzIAciMREQMnExERERERMgASIwAQERESQkRERBMycAADcABwAAAAgHB3ExIRESEhIiIiIiISIiITAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAAYAAAAAAABEAAAAAAMABgAABwAHQAQDAABEA3CGAAAREUMEAAMIQERRERMDAAAAAyBRMQBEdHEAFgMAVRExAAcwNCIgERERAwB1ADAAAgAwACAiAkQDAFAHMAAAADdwAAAwAgAAAHEwUREjIiIyUTICAAAAEzcAAANwADAAMAIAAAADNQIAExURMREyAgAAAAM0AAcDcAAwADICAAAAI3AAAhMRUTEgNycAAAADIAAAA3AAMCAyIgAAAAMAAAATURExADgAAAAREREREQOAADkREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAGAAAAAAAAQEREBAAIMDEACABEREQAAABDRBM3MRdDRAMAADBxEAMAExEREQMAE3AxMBERAABDExBDAwAQETEwEwEAAAATEQMAAAARMwATAQAAABMQAwAAABEDABMBAAAAExEDAAAAEQMAEwEAAAATEAMAAAARAwATAQAAABMRAwAAABEDABMBAAAAExADCQAIEQMAExERERETERMRERERAwcTAQAHEAMHEwAHABFzIiIiIiIiIiIiIiIiIiIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAHAAABAYFgAAAABDRBMRERERERAWAAdERAMAEAAAAAcQEBYAMQAAAAAQAAAREREQFgARAwAAgBAAAAcAABAWABExAABwEAAAQEREEBYAEREDREQUB3ABADAABgAiIiIDABAREQEAMEQGAAAAAAMAEBERAQAwEBERAAAAAwAQEREBADAQBwgAAAADABAREQEAMBARMQAAAAMAAAAAAAAwAAAwAABEAwAAAAAAADAAADAIFwADAAAACQAAMAAAMBERABNxERERERExABExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgBgAAAAAAAAAIMzMDcGd2BzAzM4AAAAAzMwMTERExMDMwAAAAEwMDAwNwADAwMDAxAAATAwMDExERMTAwMDEAABADA0MDkHAwNDAwAQAAcAIDQhEREREkMCAHAABQAwNDExERMTQwMAUAAFMDA0MTERExNDAwNQAAMwMDAzBRFQMwMDAzAAAzAwMDMFEVAzAwMDMAADADAwMAcRcAMDAwAwAAADMDAwAAAAAwMDMAAAAAMDMDAAAAADAzAwAAAAAAMwMAAAAAMDMAAAAAAACAExERERExCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxAREREREWERERERERETRAQAQABwYQEAAAAAEBMXEBEBERFhMRExERETExcQAAEAB2ExETERERMTFxB3ERERYTEAMYAXExMXEBERERFhETExERETExcABwCAAGAAMTERERMTFxERExFxYHAxMQAAExMXAAADABERETERERETExcTERcxAAcAMQBwEBMTFxNwABERETERERERExMXAxMxeAAAMQAABxATExcRERERETERERERExMTFwcQcBBwMAcBAAcTExMVExMTExMRETERERETAwcTcxNzEwlwMAAHABMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAABgAAQEREAAAAAERENIADAEAAAAADQAQ4AAAwFUNEA1ERABMBEDEQUREVAAATUREBEwEQMRBRARUAABOBBAATARAxEAEAFQAAEzEQARMBEDEEAQAVcAATMRcBE3EQcVN1CQVEQxMxEAETARABExEBETADEDEAARMBEAETEQERMwAQMVBAEwEQARMBABEDABAxEAEQARABEwEAEQNHFDEABwABFwADAAcRETEQERExABEVABMRMRERMXARETAAF3UAExERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAgAERGAAAcAEREAAAMTETERERMREQERERExAxMRMQAHExEXARERFzEDE3cxEREREREBABARMQMRETEAAEBEREREREQ0AwAAMQgAAABwAAcAAAATFQMxERFRERERMXBwAHMQAzFERARERDQiIiIiERADMQAABwcAMAB5AAcAcAMxERFRERExERERMREjAjFERERERDQAAAAwEQMANwAABwAAEhERMTARExEREREREWECAHAwMBcTAAAAAAAAYBIRERUwERMAAHAAAAdgAgCAADAREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMENENDMzEREAAAAAAAATMUQ0dzAREQAAAAAAMBERAwAzNzAwAAAAAAATERExAAAzNzcAAAAAABMRETEAADAzMwAAAAAAExJSMgAAMDAwAAAAAABzElI3AAAwMDAAAAAAABMSUjIAADA3N0dEREREExJSMgAAMDMzcwAAAABzElI3AAAwMDAxBwAAABMSUjIAADAwMBFzAAAAExJSMgAAMDc3ETEHAABzEVE3AAAwMzMREXMAABMRETEAADAwMBERMQcwEhACIQMAOTc3ERERAzgSEAIhgzAREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGIAAAAAAAAAAAAAAAAgYiIiICIiIiIhIiIiIidiAAAHAEdEBABEREREI2IAAAAwEQAREQEAABEjYgAAcDAAAABwARBwcSNiAAARMQAHCRABEBUhI2JwAAAwERExAAEIAAAjYhARADABADEAQUQTESFiAACAMHEAMQABAENEIGIAMBERERExEQEAA3AgEhEwcRBwAAEAAQADESFyEDERERERAQABAAMBIBIRMUR0J3dxABEiMhIhAgAxABEhERExAQAwACcCBzEAAAcAADADgDAxIBERMRERERERERMRERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARAQAAHAABwBARAACMREAMQAAExExAIMAEQIwEAExADAREREREQMRAjERADEREXERFxERA3ESMRdxMQAAgAAAAAADAAAxERERERERERFRERERETEAcIAAcAAAAAAACQAIMCIiIiIiIiIiExERERERQERERERERCADAAAAAAADAABAAAAAI0NEREREBAMAAAQEAAAjERABERAxAwBAEEAAACMiIiIiIjIDAAQRAQQAQ0RERERENANAEBERQABTUVFRUVFRAwQRdxcBBCMAAAAAAABDEBERERFAIwAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAgIAEAAAAAAAAAAAAMBERETARMQAAAAAAAAAwAQAQMBExAAAAAAAwERERABAwETEAAAAAADABABAAEDARMQAAADAREREAEHcXMBExAAAAMAEAEAAQEREwETEAMBEREQAQdxcAADARMQA4AQAQABARETARERExERERABB3FwAAOAEAEDEBABAAEBERMBEREQAQMQEAEHcXAAAwAQAQABAxAQAQEREwEREBdxd3FzFxdxcAADAhIiISIhIiMhERETAREQEAAACQAAAwAAAAMBEREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAAAwAwAAExcxAAAwERcDADCDBwATETEAADAREQMANxERAxMRMURENBERAxMRAAADE3ExAAAwcREDAwAAhwMTETEAADAREQNzABMRARMRMQAAMBERAxExAwAAExcxREQ0FxEDADADBwATETEAADBxEQNwMBERAxNxMQAAMBERAxMRAAADcxExAAAwERcDAwAABwMTETFERDQREQMDBxMRARMXMQAAMBFxAxExAwAAExExAAAwcREDADADkAATcTcACDAREQOAMBERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABEREREBAAwAAAAREQEAAAAAAAwAAADADAAAAAAAEBERDRwADAAMAAAAAAAAwcIEBEAMAAAAwAAAAADEREAAAADRAQwcEcEAAMAAAAAMABwADAgAgAAQ0QEAAcDACAAAwAAcAAAADAQAQMAADAAAAAQAAAAMAAAMAAAICIRIREAAAAwAAAAA0QAAAAAAABweDAAAAAwAAAAACAgABERMEREADAAICIiIiAHAAAAcAcAAwcAAHBwKAIAAAAgAjAAARARERERAAAAAACQMAAAAAAAAAARESEiERERESEiEREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAREREREREREREREQ0AAAABwBwAABwAABwADAAABERABERABFRABEVMAAAAABwAAAHAABwAAAwAAABEBUBEFEBUBEBEDAAAHAAAAAHAAcAAHAAMAAAEREAEREAEVEAERUwAAAAAAcAAAcAAAcAADAAAAEQUQEQFQFQEQEQMAAAAAcAAAcAAAcAcAAwAAAREQAREQARUQARFTAAAAgAkAAAAAAAgAAAMACAERERERERERERERERFhEREREREREREREREREWERERERERERERERERAAYQERERERERERERERGAhhAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAABgAAAHAAAAAAAAAAAHAGAAExEDABAxEQAAExEDYDABBzETMTMzETMBBzFgMRERMREzMzMTExERMWEAAIAAMDNzMzMAAAAAYBERERExMzMzMxERERFhEHERABAzMzMTABEXAWAAEQEAADEzMwEAEBEAYAAQAAAAEDMTAAAAAQBgAAAAAAAAMQEAAAAAAGAAAAAAAAAxAQAAAAAAYAAAAAAAADEBAAAAAABgAAAAAAAAMQEAAAAAAGAAAAgAAAAwAACQAAAAYBERERERERERERERERFhAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARESIRERERERERERERYQEHIAAAcAAIAJAAAABhMTEgUTEREREVERERAWExEQNRMRNxRERERAcAYTEQMVARMxEHAAdwEQNhMQARAxExE3EAABcBE2MxAxAxEDEzEQdwEQAzYzEzBzEDMTETARABEDNhMTMDMDEwETNREQAxM2FxMzM4ETMRMVMBMDM3YTFzADMQMRARU3AxMxNhETEREQcRAxEDEDODM2ExMzMzAxAzMIMzcwAzYTEwAwcwABMzEzMRETFhcTAxEREDAAAzcwAAMGARETEzcxMRETMREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIiIiIiIiBiAiAAAAICEREREhESIGECEAAAAQEgBwACEhIQYgIQAAABAAIxFRAQAgBgghAAAAF3ATEQEAREQTISEVEREjMBNwAUQkIRMAACURERMwExFEBCAhE0REJRERIzETQUQAAAAjAABwECETMRNEBwAREhMAABUhEhMxQwRCREREAwBERAQRAzEAIIEAByBTEQIJBwATMREVEgESIVMRIiESAgAwERUCAAAgUwAACAcSERERFUJERERTEQAREQJwEBEAAHAAIAMAAAAAEBERIREREjEAAzARIREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBEREREBJAAQEREREQEAwBARAQQEREBQEQEADADAEBEEBEREREBRAQAMAMAQAQRERERERFABAAwAwBAEBERd3cREQEEADADAEAQERERERERAQQAMAMAABERERERERERAAAwAwAAEXd3ERF3dxEAADADAAAREREREREREQAAMAMAABEREXd3ERERAAAwAwAAEBEREREREQEAADADAEAQERERERERAQQAMAMAQABxdxdxdxcABAAwAwBABBARERERAUAEADCDd0dEBxAREQFwRHR3OBERERExd3d3dxMRERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAREREREREAABERESIRYUFEREREREREREREEAFhARMRERERA2BBRERDRGQJc3J3BwADYHEAdwMAZxETERESEQNgETERUTFhATMzAwJwA2BxMERENGBxAHIDcBcDYCEwICIwZxEREVEREQNgcTAIcDcyAXByBwIQA2ARERETETEBICICAhBDNHEAAANwZwF3B3dyEHM4IQcAAxExMRFRERETERERERMRETExRERERBMRQEREQwJENDFwAHcHA3ADBwcDMgcXERMxEhMRFRMhURERMRFwczcIAwAAAwAAAHA3dwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMxARETgiAiIyGBERMCMjM3AwIzMzMyMzcDAjMzcyMTEyFzERNzIxMTIXASMzIwMBMwMBIzMjAzEQMzIyEzAAMBAzMjITABMwMzMQAxEBEzAzMxATEwMAABMTcBATAwAAE5MTMDMzEAMRARMwMzMQExAzMjITMAAwEDMyMhMABSMzIwMBMwMBIzMjAzE3MjExMhcxETcyMTEyFyMzcDAjMzMzIzNwMCMzMhARETAiMiIyEBERMCIyMHAwMCIzIzIwcDAwIjIwMTE4IzMjMzgxMTAiIyMzIyMzMzMjIzMjIzMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEJEREQARAQzEQNgBwB4QkREdBEAMBMxA2ARMRECAAAXAQAzETMHYAAwAAIAcBEAMBMxcyBiBzBwAgAXAQAzETMHImARMRECcBEAMBMxcyACYAA5AAIXAQAzETMHInBnETFwchEAMBMxcyACEwERMRESAQAzETMHIgBzB3ExAAIHMIMwcyACExEBETFwEhERERERIwBzgAcXMRFCREREREQjMBERARExcHJwAAMAACAwBwAHISIiEhEAAxERIDAREQEAAAAAAIATcRchMAcABxERERERERIRESEQERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAzAwAAAAAAAAAAAAAAMDMDAAAAAAAAAAAAAAAAMAMAAAAAAAAACAAAAAAzMwAAAACAAERERERENDMzQ0REREREREREREQ0MzNDRERERERARERERDQzM0NEREREBABARERENDMzQ0RERAQAAABAREQ0MzNDREQEAAAAAAAARDQzM0NEAAAAAAcHBwcHMDMzA3BwcHBwAAAAAAAwgzkDAAAAAAARERERETETMRMRERERERERERERMRMxExERERERcHBwcAAAAzAAAAcHBwcREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAiIjJEREREREREAAgAAAAAMAMAAAAAADAiIiICEzAWAzgyAAAAMERENBADMQAiIjIyAgkAAAAwABFgUUNENDBRESEiEDEQMWZRAwAwMAEXAHAAMBAwQVQDAAAwAXARESAycBMHdwMAADABGBERADAQEwAQUwcAAAEREXEgMmYTExEDAQAAARcREXAwAAETAQMQAAABERERMDIQEQMRAwABADFwcRAwMAABE3ADABAAMBERETAyEBABEQMAAAABAAAAADAAAAAAESISERERESIiISEiISIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAARERERERERMRFwAAAACQAACAAACAAwERUiIiIyBzAzMzMzMzAAAAAAADBxMAAzMzMzMHBwMBERMRA3AAMAAAAwEBYQERExADEAc3BwcAADAQAAADAAEAcTFRUVMAAAgAcHNwAAAQMAAAAAAwAQExExAAAAAwMDAzAAAAADAAAAAAADAAAAAAMAAAMIAAAAADAwMAAwAAAAERExAAAAAAMDAwADAAAAADAAAAgAcBYAMACAAAAAMBERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABABAAAAABABABABBAREXE0EREREUMXEXEEEBERETcRERERcxEREQcQERERMRERERETERERARAREBExEQEAABMRABABEBEAETERcXcAExF3RwQQEQARMREREQATERFxBBARABExERERAAMREREHEBEAETEREREAAxAREQEQEXARMREBAAADAAARARARFxExEXF3dxNxdxEBEBERETERERERE1EREQEQERERMBEREREDURERABAREQEwEREREQNQEQEAAAiAADAAkAAAAwAIgAARERERYRExExEWEREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGBEREREEAMAAAAAAHAAZwBwcQATExISEhJSEhISABcQBxMDAHAAcABERERwAQBxEyEhISEhMQAAMBAAAFATIiIiIiIyAAcwAAAAAENERERENBFRETEAAAAAAAAAAAAwAQAAMAAHeQAAAAAAADABAAAwExEREQMIB3AAMAEHcDgDeAAHExISEhISIiElMRMRERETERFxEBEAAAAwA3BwABMREREBEQAAADATERERExEREREQAAAAMAMABwcTEREREQFwAAcwEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABEWEhISEiIBYSEQYRERERYRESEhMgJiEhBgABMhBgAAEAIwAGBwAGgAExFREUNERDQRFRERERETkHAAcxNyMCAAEgIQABMRETERIyEABwIAIEBEEwASMAIjIiESIABERBQTBwgwAAMQRERERCRwERNREjEAcyJxEHIAAhABE1IgMAAnIRIHEkQ0AQATAAEwcAJ3B3IAAjAAAANDRDQnMCEBIAcAMREREQMDIEI0AAAAAnAwICIiAxMSdzBEAzAQETEAAhADc3ARh3dDNAARMgCAFxEREREREQM3FxERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARAQAAAAAAYAAAB4BwACICAACHAAdgExERERERETERERERERFDRERERAQiMgAAAAAAAAAAAAAAMBExAEREREQEQEREREQ0IjIHAAAAADADB0BElAAREREAAABwExERAQAQAyIiIgAAeBMRAAQBABADERERAHATERERNwEAEAMiIiJwExERERcxAQAQQ0REcBMRERERETcBABADIgIjIiIiIiIXMQF3EAMRAQMAAAAAABE3EREVAyICExERERExFzEACABzEXETBwAAADAREREREREiEhEiIiIiIgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAREREREREREQAAAAAAAAAAHAAAAAAAIMAAAAAAAAAdwcAAAAwMwAAAAAAAAB3BwAAADAzAAAAAAAAcAcAAAAAMwAAAAAAAHAHdwcAADMwMwBEREREd3AHcAcwAzMAMwCAAAAAMAMAAAAAMwAAADMzA4AwMwAAAAAzAwAAd3cHMzMwAwAwMwMzAAAzMwMAADADAAAAADMAAHd3BwAAMAMAAAAJMwAAMzMDERERERERExEREREREREAAAAAAAADAAAAAAAAAAAAAAAAAAMAAAAAAAAAEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAHAAAAAAAAAAAAAABgAjEQAAAAAAAAAAAAAmMiMXAQcAAAAAAAAAcCYyAxAXEQAAAAAACBERETEDEBAAEXEAABARcAAAMEMEEAcBEAAHEQciIgAwAxAREQEAEVEBAAAQETJzkAAAAAAAABAiMgEHMCMiQkRERAQAAAAwEXEwAwACAIB3dwAAADAAEREDB3IAIiIiIiIAMHACcBMREQAAAAAAAAAwESIRQ0Q0REREAAAAADAAAAAAADAAAAAAAAAAMAgAAABwMAAQERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAADAAYAAAAAAAAAMAEBERMQAwREREREREAwAQAAcxADAAAAAAAAgDABAAADEAMCIiIhEiESISIiESIiEyQUREUREBEHAIBwAABzABAwBBBAEQERERURERMQETd3ExcRBAREREREQ0ARMRUTEBEIMAAAAAADABcwBANDMRExERERERMREREQMHMAADAAAAAAA5AAAAEwEwM3MREQEHETERcBATRwQwEwEHERFxMBcRERNxEDERERERERERERERAxAREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARERFjAAAAAAAANhERERExM2cAAAAAAAB2MxMRMxExMwcAAAAAcDMTFTM3M1ExM4cAAHgzExEzcwA3MxExMwdwMxMVM3MAAAA3M1ExMzMTETNzAAAAAAA3MxExExEzcwAAAAAAAAA3MzETM3MAAAAAAAAANzMRMRMRM3MAAAAAADczETEzMxMVM3MAAAA3M1ExMwdwMxMRM3MANzMRMTMHAABwMxMVM3MzUTEzBwAAAABwMxMRMxExM2cAAAAAAAB2MxMRERERYwAAAJAAADYREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAABgAAgAAAAAAABwAAAAAGIiMiAgAAAAAiIiMiIgYAAwAQBwAAEAAAE0BERkRDREQBAABBREQjA3BxAANwABAAEAAAABNDBBAIQ0QQAwEBAAcAIwAwAAEAAAEDUAAAAAATBzAJEAAQAAMAAAAAByNANCIBAQEAE0BERAQBEwMAAABRAAADAQcAEAAjAwg3EQEAAAMQAAABBxMRMTFCREREAwABEAARExExMAAAAAAAAFAFAAADADAwAAAAAAAAAAAAAAMAMCIiIhERESEiEhEhIiIiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAABAREREBEBGRAAAAAAAAAMAAAAwBAAAAxMRMQAAQ0RERDhEREQwAUMQAwADAAAAEwBEBBMAAwc1AAMAADAFMQAwAQADABcAA0AEEwAQAwRJRENEFAMxYzBxEwExAAEAAAAQExBjMBERETEAEREQERERFWEwARAHMTQAAAQAOBEVYTAREREBMBEREBExAQdhMAEXADEwcREQETEREWEwERERMTARERBxMRERYTABEAcwMAEAEAAwAQBhMBERETEwERURFTEBB2AxAAAAMTEAEAAHMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAGAGAAAAAAAAAAAAAAAAYEZERAMAAENERDQBAAAxAAAAQ0REAwAAMAEHADFwAAADAAADCAcwERFRMREBBzEDABEREREREVExERERAQMHAAAAAHAAADAREXEAEwEAFwcAEQAAMBEREQcTAXARcQARAAAwERERcRMBFxERBxGAcDARERERE1ERERERETEiMQEAAIADAAAAAAAAMBAxAXAAEQMAAAAJAAAwEDERERERQ0Q0ERFzRDQQMQFwAAADcDARFxMAMRcxERERERERERERExExETEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAREREAAAAAAAAAAQAEBEAAABDBAAIMBERAAAQBwAAMEQQERExEREAABARAABABFARETVxFwAAAAAQEQUAUBERNRERAAAAABARBRFUcRc1AAAVEQAAEHcFEVARETUAABURAAAQEQUAAAAAMAAAdRcAAAAAAAAAAAAwAAAVEQAAAABQEQUAADAAAAAAFREFAFB3BQAAMBURAAAVEQUAUBEFAAAwFREQAQUHBQAAAAAAADB1FxABFREFAAAAAAAAMBURAAAAAAAAAAAACAAwkAAAABERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcAAAAAQEgABAAAAAhBMRMBERFxcREQMEAEAwA3AwERERERERA3RAcDATETARFxERFxFDAAQENANwMBEREREREQMHAAcwExEwcREREXERA0QABDADcDAREREREREDBAd0NBMRMBEXEREXEQMABEAwA3AwERERERERA0BAADATETARcRFxERFDAAQENANwMBEREREREQNwAEAwExEwEREXFxERAwBEcDADcDAREREREREDBEBAMBMRMBFxEXEREQMHBAQ0AwgwERERERERAwAACQATETERFxERFxETEREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAGAAAAAGAACAAAAAAAAAYEQECEZERBQREQMAgABgEyERARERETEXERERETETcREBcgAwMREAcABwMBMREQEiIjIyAEBEREQwAwAAAEBENDAAMAAAADARFREDAAAAMAAwAAEAMEQEABMREQERERExERERBwATAQAAREQBMzMzM0QAABMAIjIAAHEzMzMzcBMRARAAICIDQTMzMzNAAwAAATAREQNxMzMzMwADABMAMBERA0EzMzMzAJMAEwMwARcDERERERExEREREREREQEAAAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAEAxERERERERERERERETADAQAQAAdwAQAAAAEQMAMBBxARUREBAAAAARAwA1EREQAAEHAIBwABFzADAQABAAAQERERERERMAMBBwEAABAAAAABABAwAxERAXCAEAAAAAEAEDADAQARERERAQAAAXAQMAMBAAAQAABxAAgRFREwAwEHcBAAABEREQEAEDADEVEREQAAAQABAAAQMAMBB3EAgAdxAAEHABAwAxFREREREREVERFRETADAAAAAAAJAACAAAAAMBERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAwAAAAAAAAA4AAAAADADAAAAAAMIEDERAAAQMRMBAAAREwERNxcBABExExEAEHFzEQEwAAAQcTADFwEQAAMAETcHRBQBMAMAABBxcwAQMREAEHEwgwcAABETAQA3FwEAETETAQAAcHMRADAAAQAQMRMRQAQAAxARNxcBAHAwAxcBEHFzERA1FQAAADADEAEAEVMBADAAABBxMIMXAQAAAwAAAAAAABExExEAAAAAAAAAAAAAEDETAQAAAAAAAAAAAAkAMAMAAAAAAAARERERERExExEREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAAAAAAAAAAAAAAADQAQAAEBERERERERERAMABgAANwAABwAwAIAwEQERERExRERENDAwIiJwAAAAADBwAAAwMDAAACIyEQEIMERERDQwICIyADBwEBERAAAHMDAAADCQMBARERdEREQ0MDAiIhMwRERERERERDQwMHAAExERERUREQCAADAgIjJzABERAAAQBxARMQAAMBMREREREREiEBERMRERIxEREREREQAQERExEXEjERERERERIxBxETERESNwEREREREjAAAAMAAAAxEREXEAACMREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAQAAAABxdgEAAAAAAQAQRDRERBQTREQ0RBQAAABxMIAAcHMAgDBwAQAAABA0NEQUE0Q0NBQAAAAAAAEwAAUDBTAAAQAAADBEFDAQREMUMBBEREQDMDQAMQEAAAAxAQAAQwMAMAAxAQAAADEBAAADADA0ADEBCQcAMRERAEMDMAAAMRERERExEREAAAMwNAAxARERATERFwBDAwA3ADEBERcBMRERAHMAMDQIMQEREQExAQCAQwMwREQwQAAAQDBAREREAzAAADEBEREBMQEAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABhAAAAAAAAAAAAAAAAEGFEREREREREREREREQUYQAAAFARMRFRAAAAABBhAABXUQAwAFARcAAAEGEAV1F3dzd3eBcVcAAQYRBRURERMRERERUVcBAREQAAAAAwAAAAABAVFREAAHB3BzAId3cAABAVAQAwERERNRERETEAABABADAAAAAwAAAAMAAAEAEANwB3dzdwcHc3gAAQAVMRERERMRURERERAxABAwAAAAAwAAAAAAADEAEDAAAAADAAAAAAAAMQAQMAAAAAMAAJAAAAAxAREREREREREREREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARERERERENERERERERERwAAAABwAwAHAAcIAHcHgABwCAcDBwAHBwAAAAEBVRMTBREREDExUAAAAQFVERM1ERETUTFQAAABAVURE1URERFRMVAAAAEBUAETVRARAVExUAAAAQFQARNVEBEBUTFQAAABAVABE1UQEQFRMVAAAAEBUAETVRARAVExUAAAAQFXARNVEBFxUTFQAAABAVFRE1UVERFRMVERUBEBUVETBRUREFExURFQEQFRUBMFFREQATFREVAQAAAAAwAJAAAAMAAAAAEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIcAABAREREREREREREREQMAEBERERERERERERETETEAABERERERERERERMREREDCBARERERERERExEREBExAAARERERERETEREQERERAwAQERERERMRERARERERMYAAERERExEBBxEREREREQMAEBETERERcBARERERETEAABMRERARAQcRERERERExExEREBEREXAQERERETETEREQEREREQMHERERMRMRERARERERExEQERExcwBwAHAAcBATERARETERERERERERABMRAAAAORERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAAAAAYAAwIiIiIiIiIiIRMxExETEAAIAAQERERHExATEBMREREREREQAHATFxMXExM3MzMzczETFRMxExATEjIjIjIjMAMDMzMzMzMyMANyMAMxFzMwAAAxEwI0AyI3AzARMzEBEDcTEjIjIjIjMxEDMQBwMQMUNEBDMzMzEAMxABAwExAAcAMzMTETEzAACTETAREREBcBMRNzMzMyMiMjEzMwIRExEwAwAAByAyMTAwAhEDERMRETEAgAAxMDcCcBOAEwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAICIAAAAAAAAAAAAAAB3d3cGAAAAAAAAcHd3ZxEREQEAAAB3d3cmIiIiAAAAAAAAYBEREQEAAAAAAAAAAABgBgAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAB3dwYAAAAAAAAAAAAAABERAwAAAAAAAAAAAAAAEREREREDAAAAAAAAAAARERERERERMQAAAAAAABERERERERERETEAAAAAEREREREREREREREDAAAREREREREREREREREDABERERERERERERERETEAERERERERERERERERMQkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAABgAHAAcAh4AHAAcABwARERERERERFhEREREREQAAAAAAAAADAAAAAAAAAAAAAAAAEBMAAAAAAAAAAAAAAABwcwAAAAAAAACAAAAAABETAQAAAAgAADAAAAAABwMHAAAAAwAAMQEAABARExEAABATAAA3BwAAcAADcAAAcHMAEDERAAARERMRAQAREwFwMHAAAAcAAwAHAAcDBxExEQEQERETEREQERMRBzAAB3AAAAMAcHAAA3AAMAAAAAAAAwkAAAADABERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAGAAAAAAAAAAAAAAAAAIYABHRAAAAABARERENCIiUREAAwAAAAMAAAAwAAAAcAADAAAAAwAAEBERISIREREBAAADAAAQBwEAAQABAAEAAAMIdxAAAXABdwF3AQcAExEREQAREREREREREQETAAEREQEAAAEAAAAAABNwAQcQADAHAQkAAHAAExERERERMhIREREVEREDAAAAAAAwAAAAAABEBAMAAAAAADAAAAAAMAAHAwAAAHAAMAAAAAAwEBERERERERExAAAHCDAABwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAGIBERAAAWEREREREREQYgcBNwAEZERERERAMQQyQREyAiNyEBAAAHQxQDAAcTADAyABABAAADEAMgERMANzIRABcAkAMQAycIE0M0M3ARERERAxADIDERAzADEBEAACADEAMAMAADBwMAEQAAJwMQMQAwABMRMwAQEREhgwARMTAAAwAyEUFERCQRAwARMQMTMTEAAAgAAAAhAwAREwAwMRERETEAAAAhAwATADAxERcRMRERMREhMhMRMDEREXExERExB3AwEwcwMRERERERERERETERETEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABmZmZmAAAAAAAAAAAAABMRETEAAAAAAAAAAAAIE4AAMYAAAAAAAAAAAAATAAcxAAAAAAAAADAREREREREREQMAAAAAMAEAEAAAAQAQAwAAAAAwAQAQAAABABADAAAAADABABAAAAEAEAMAAAAAMAFwEAgHAXAQAwAAExERERERERURERERETETAAABABAAAAEAEAAAMRMAAAEAEAAAAQAQAAAxEwAHAXAQAAcBcBAABzETEzExERMTMTERExMxMQMTMTARkxMxOBEDEzEwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABERERERAAAAABERERERAMAAAAAEREREQAAAAAwAwAAABEREREREQAAADADAAgQERERERERAYAAMAMiIhERERERERERIiIwAwAAABARERERAQAAADADMgAAAAAREQAAAAAjMCIyAAAAAAAAAAAAACMiADAAB3AAB3AAB3AAAwAAMAAAAAAAAAAAAAADAAAwAAAAABERAAAAAAMAADAAABARVVURAZAAAwAAMAARUVVVVVUVEQADAAAwAFBVVVVVVVUFAAMAADAAAFVVVVVVVQAAAwAAMAAAAFVVVVUAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAREREREQEAAAAAAAAAAAAAAAAADAAABAAQEAAAAAHcAAHOEREEBEBAxEREREREREBAAATEQEDFRF3AAAAcAdERBMRAQMVEREHAAAXMQAAEBABA3UXEXEAcBExREQQEAEDFREREQcXEQEAABMQAQN1FxERcRERAYAAExABAxURERERERExERERdwEDdRcAAAAAADAAABARAQMVEWEBAJAAMAAAAACAA3UXYRERERERMRERERERFRFhAAARcRExERFxAAAAAGEAABERFzERBxcxAABwYQdwEREBMAAREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABEREREWERERERERERERCQIgIgYAMhAAMERERAQxADAgIwIyFyMyAAAAADciMSAjAjAAAwAAAAAHEQMwIAMQESNDREQAAAAnEyEnE0FEIwMAAAAREQADACAjcAIjEQBwAAAAgANwICMRESMwAAAAgAAiERMgIwAAQzQiIiIiIgMgEwAjERERMAAgREQkEwATESNwcQARMSAwACAjMCIgIwABAAAwADAAICMwAicDABERERERMQIgAxEBIiMRAQAAAAAwACADAIAAIwcycAAABzAAIBEREREhETciEREiMgAnAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEQGAABARAAABABEAwADQCEiIgIAEREgMgBzAHMAAQByAAAAAAAwcBFDIgMyACIhUFUVARMVcAN4AzIAcgAAAAAAAwATQSMCMgMiMVAAAAUDAHMAcwACMwAyAHEXAAMAEUMiAwIwAzIAEDFEAwd4A3ADAgAzMgAAMAARFRNBIwICADAyAAgwAAAAcwBzCAIAADIiIiIiAwcRQyIDAgAAMgFwcBATFXADcAMCAAAyMSEhEQMAE0EiAoJ3EzAxcHAAAwADCQAAERERIhESEhISEgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAGAAAABgAIAAAAAAAAAGAAAGAAAAAAAAAAAAAAAAYABgAAAAAAAAAAAAAXERMRBwAAAAAAAAAAAHFxc3EBAAAAAAAHAAAQNzAxMBcAAAcHABETExERMTARERETEwFwARMDAAAwMwAAABNzARAwEzMzMzMzMzMzEzMQEIMHMTMzMzEzMzMBhxMAETEQAwcwMAAHEzARAQBwERMRERETERERE3EAABABAwAABwMHAAADEQAAEDARMzMzMTMzEzEQAHAAExEzEzMzEzMTEZMHEREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAQAAAkAAABAAQcAAAEREDEREREREwEREQETEREQMBEBEREDAREQBwMHERAwEREQEQMBEXMBEREREDARARERAwEREwBwARFwMBEREBEDBxERARMRERAwEQEREQMBERAAA3cREDARERARAwEREwEREREQMBEBEREDAQETBwABEXAwEREQEQMBEREBExEREDAQARERAwcREABzBxEQNxERFxFzARETARERERAxERERERMBEHMAAHERcDEREREREwEREQETEREQOAAACAADAREQAIMBERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAIAEAAAAAJQABgAABAAAMDAAAAAwMAAGADAwADADMAMAAAMAAwYAAwADMBA3MAAwEBcwBjAQFzA0EDEARDQYETBENBgTADASMREVIRESIREVIRMVMQEwAAUQABcRABcQAwUwQTRERRQwQUQ0RERDQTQBMAAFEDABEDA1EAgHMFEyIVESMRESITUSIVExUBERABAxEQAQNREAUDEAMEQERDFBBEQ1QQREMQAxAXAAMQFwADEAcAAxcDEBIAAxASAAMQEgADFRMFAhETAQIREwECFRMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIhgBogAAAAAAAAAAABwdxZhdwcAAAAAAHB3dyYiIiIiYnd3BwAAFhERAQAAAAAQERFhAABmBgAAAAAAAAAAYGYAAAAGAAAAAAAAAABgAAAAAAYAAAAAAAAAAGAAAAAABgAAAAAAAAAAYAAAAAAGAAAAAAAAAABgAAAAAAYAAAAAAAAAAGAAAAAABgAAAAAAAAAAYAAAAAAGAAAAAAAAAABgAAAAAAYAAAAAAAAAAGAAAAAABgAAAACQAAAAYAAAEhERIRERIRIRERIRESEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADARAAARAwAAAAAAAAAAEwEAABAxAAAAAAAAADARAAAAABEDAAAAAAAAE3EACAAAFzEAAAAARzQREREREREREUN0CDAxABBxAAAAABcBABMDMBMDABFwAAAHEQAwMQNwMzEIEBEBEBEBABMzBwA3EwMAEQEQEQAwMXMAAHAzMQAQcRkBABMzBwAAADcTAwAREQAwMXMAAAAAcDMxADADABMzBwAAAAAANxMDMAMwMXMAAAAHgABwEzEwAxMxBwAIcBERERERERERERERERERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABARAQAAACACQAAAEBEBAMAEDEHAAAAAHATAQAwAwAQMQcAAAAAcBMBADADAAARcwAAAAA3EQAAMHNwABFzAAAAADcRAAc3ExExEDEHAABwEwETETFzADcQMQcAAHATAXMANxMREQMRcwAANxEwERExcwh4AxFzAAA3ETCHgDcTERExEDEHcBMBExERMXMAADcQMQdwEwFzAAA3ExEREQMRczcRMBERETFzAABwAxEREREwBwAANxMRERExEBEVARMRERExcwAAADdwF3UHcwAAADcREREREREhEmEREREREQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+  // src/machine.js
+  var decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+  var image = decode(program);
+  var levels = decode(levelData);
+  var CLOCK = 1020484;
+  var Machine = class {
+    constructor({ testLimit = 150, onSpeaker = () => {
+    }, onScores = () => {
+    } } = {}) {
+      this.testLimit = testLimit;
+      this.onSpeaker = onSpeaker;
+      this.onScores = onScores;
+      this.mem = new Uint8Array(65536);
+      this.cpu = new CPU6502();
+      this.page = 8192;
+      this.key = 0;
+      this.loads = [];
+      this.highScores = null;
+      this.cpu.addPageHandler({ start: () => 0, end: () => 255, read: (p, o) => this.read(p << 8 | o), write: (p, o, v) => this.write(p << 8 | o, v) });
+      this.reset();
+    }
+    reset(level = 1) {
+      if (!Number.isInteger(level) || level < 1 || level > this.testLimit) throw Error("Level outside allowed range");
+      this.mem.fill(0);
+      this.mem.set(image);
+      this.cpu.reset();
+      this.key = 0;
+      this.page = 8192;
+      this.textEntry = false;
+      this.mem[149] = 203;
+      this.mem[153] = 1;
+      this.mem[140] = 6;
+      this.mem[167] = 2;
+      this.mem[166] = level;
+      this.mem[150] = level - 1;
+      this.mem[157] = 1;
+      this.mem[31] = 32;
+      this.mem[135] = 32;
+      this.cpu.setPC(24662);
+    }
+    read(a) {
+      if (a === 49152) return this.key;
+      if (a === 49168) {
+        this.key &= 127;
+        return this.key;
+      }
+      if (a === 49200) this.onSpeaker(this.cpu.getCycles());
+      if (a === 49236) this.page = 8192;
+      if (a === 49237) this.page = 16384;
+      if (a >= 49152) return 0;
+      return this.mem[a];
+    }
+    write(a, v) {
+      if (a >= 49152) this.read(a);
+      else this.mem[a] = v;
+    }
+    press(code) {
+      this.key = code | 128;
+    }
+    ret(a, clearCarry = true) {
+      const s = this.cpu.getState();
+      let sp = s.sp;
+      const lo = this.mem[256 | ++sp & 255], hi = this.mem[256 | ++sp & 255];
+      this.cpu.setState({ ...s, a: a ?? s.a, s: clearCarry ? s.s & 254 : s.s, sp: sp & 255, pc: (hi << 8 | lo) + 1 & 65535 });
+    }
+    hook() {
+      const pc = this.cpu.getPC();
+      if (pc === 34291) this.textEntry = true;
+      if (pc === 25358) {
+        this.textEntry = false;
+        const index = this.mem[150];
+        if (this.testLimit < 150 && index >= this.testLimit) throw Error(`Testing boundary: level ${index + 1} blocked`);
+        if (this.cpu.getState().a !== 1) throw Error("Original disk editing is unavailable");
+        this.mem.fill(0, 3328, 3584);
+        if (this.mem[167] < 2) {
+          const addr = 40448 + this.mem[166] * 256;
+          this.mem.set(this.mem.slice(addr, addr + 256), 3328);
+        } else if (index < 150) this.mem.set(levels.subarray(index * 256, index * 256 + 256), 3328);
+        this.loads.push(index + 1);
+        this.ret();
+        return true;
+      }
+      if (pc === 25433) {
+        if (this.cpu.getState().a === 2) {
+          this.highScores = Array.from(this.mem.slice(7936, 8192));
+          this.onScores(this.highScores);
+        } else if (this.highScores) this.mem.set(this.highScores, 7936);
+        this.ret(1);
+        return true;
+      }
+      return false;
+    }
+    run(cycles) {
+      const end = this.cpu.getCycles() + cycles;
+      while (this.cpu.getCycles() < end) {
+        if (!this.hook()) this.cpu.step();
+      }
+    }
+    snapshot() {
+      return { version: 1, cpu: this.cpu.getState(), memory: Array.from(this.mem), page: this.page, key: this.key, textEntry: this.textEntry, highScores: this.highScores };
+    }
+    restore(s) {
+      if (s?.version !== 1 || s.memory?.length !== 65536 || !s.memory.every((v) => Number.isInteger(v) && v >= 0 && v < 256) || ![8192, 16384].includes(s.page)) throw Error("Invalid save file");
+      for (const k of ["a", "x", "y", "s", "sp"]) if (!Number.isInteger(s.cpu?.[k]) || s.cpu[k] < 0 || s.cpu[k] > 255) throw Error("Invalid CPU state");
+      if (!Number.isInteger(s.cpu.pc) || s.cpu.pc < 0 || s.cpu.pc > 65535 || !Number.isSafeInteger(s.cpu.cycles) || s.cpu.cycles < 0) throw Error("Invalid CPU state");
+      if (s.memory[150] >= this.testLimit) throw Error("Save exceeds allowed level range");
+      if (!Number.isInteger(s.key) || s.key < 0 || s.key > 255) throw Error("Invalid keyboard state");
+      if (s.highScores !== null && (!Array.isArray(s.highScores) || s.highScores.length !== 256 || !s.highScores.every((v) => Number.isInteger(v) && v >= 0 && v <= 255))) throw Error("Invalid score data");
+      this.mem.set(s.memory);
+      this.cpu.setState(s.cpu);
+      this.page = s.page;
+      this.highScores = s.highScores;
+      this.key = s.key;
+      this.textEntry = !!s.textEntry;
+    }
+    status() {
+      return { level: this.mem[166], map: this.mem[150] + 1, lives: this.mem[152], gold: this.mem[147], col: this.mem[0], row: this.mem[1], guards: this.mem[141], pc: this.cpu.getPC() };
+    }
+  };
+  function pixels(machine2, mono2 = false) {
+    const out = new Uint8ClampedArray(280 * 192 * 4), bits = new Uint8Array(282), phase = new Uint8Array(280);
+    const palette = [[184, 66, 255], [65, 222, 57], [43, 147, 255], [255, 146, 48]];
+    for (let y = 0; y < 192; y++) {
+      const addr = machine2.page + ((y & 7) << 10) + ((y & 56) << 4) + (y >> 6) * 40;
+      bits.fill(0);
+      for (let b = 0; b < 40; b++) {
+        const v = machine2.mem[addr + b];
+        for (let n = 0; n < 7; n++) {
+          const x = b * 7 + n;
+          bits[x + 1] = v >> n & 1;
+          phase[x] = v >> 7;
+        }
+      }
+      for (let x = 0; x < 280; x++) {
+        let color = [0, 0, 0];
+        if (bits[x + 1]) color = mono2 ? [111, 255, 146] : bits[x] || bits[x + 2] ? [245, 245, 236] : palette[phase[x] * 2 + (x & 1)];
+        else if (!mono2 && bits[x] && bits[x + 2] && phase[x - 1] === phase[x + 1]) color = palette[phase[x - 1] * 2 + (x - 1 & 1)];
+        const i = (y * 280 + x) * 4;
+        out[i] = color[0];
+        out[i + 1] = color[1];
+        out[i + 2] = color[2];
+        out[i + 3] = 255;
+      }
+    }
+    return out;
+  }
+
+  // src/app.js
+  var $ = (id) => document.getElementById(id);
+  var canvas = $("game");
+  var ctx = canvas.getContext("2d", { alpha: false });
+  var running = false;
+  var started = false;
+  var mono = false;
+  var sound = false;
+  var last = 0;
+  var audio = null;
+  var audioTime = 0;
+  var speakerLevel = 0.16;
+  var speakerCycle = 0;
+  var audioEvents = [];
+  var storage = { get(k) {
+    try {
+      return localStorage.getItem(k);
+    } catch {
+      return null;
+    }
+  }, set(k, v) {
+    try {
+      localStorage.setItem(k, v);
+      return true;
+    } catch {
+      return false;
+    }
+  } };
+  var machine = new Machine({ onSpeaker(c) {
+    audioEvents.push(c);
+  }, onScores(s) {
+    storage.set("lr-scores", JSON.stringify(s));
+  } });
+  try {
+    const scores = JSON.parse(storage.get("lr-scores"));
+    if (Array.isArray(scores) && scores.length === 256) machine.highScores = scores;
+  } catch {
+  }
+  function prepare(level = 1) {
+    machine.reset(level);
+    machine.run(CLOCK * 9);
+    audioEvents = [];
+    draw();
+  }
+  function draw() {
+    ctx.putImageData(new ImageData(pixels(machine, mono), 280, 192), 0, 0);
+    const s = machine.status();
+    $("status").textContent = `LEVEL ${String(s.map).padStart(3, "0")} / 150 \xB7 ${s.lives} LIVES`;
+  }
+  function note(s) {
+    $("save-status").textContent = s;
+  }
+  function overlay(title, copy, label) {
+    $("overlay-title").innerHTML = title;
+    $("overlay-copy").textContent = copy;
+    $("start").textContent = label;
+    $("overlay").hidden = false;
+  }
+  function pause() {
+    if (!started) return;
+    running = false;
+    $("pause").textContent = "Resume";
+    overlay("Take a breather.", "Your run is paused.", "Resume \u2192");
+    audioTime = 0;
+  }
+  function play() {
+    if (!started) machine.press(32);
+    started = true;
+    running = true;
+    $("overlay").hidden = true;
+    $("pause").textContent = "Pause";
+    canvas.focus();
+    last = performance.now();
+  }
+  function soundFrame(start, end) {
+    if (!audio || !sound) {
+      audioEvents = [];
+      return;
+    }
+    if (audioTime < audio.currentTime || audioTime > audio.currentTime + 0.15) audioTime = audio.currentTime + 0.025;
+    const count = Math.max(1, Math.round((end - start) / CLOCK * audio.sampleRate)), buffer = audio.createBuffer(1, count, audio.sampleRate), data = buffer.getChannelData(0);
+    let j = 0;
+    for (let i = 0; i < count; i++) {
+      const c = start + i * CLOCK / audio.sampleRate;
+      while (j < audioEvents.length && audioEvents[j] <= c) {
+        speakerLevel = -speakerLevel;
+        speakerCycle = audioEvents[j++];
+      }
+      data[i] = speakerLevel * Math.max(0, 1 - (c - speakerCycle) / (CLOCK * 0.025));
+    }
+    audioEvents = [];
+    const source = audio.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audio.destination);
+    source.start(audioTime);
+    audioTime += count / audio.sampleRate;
+  }
+  function frame(now) {
+    if (running) {
+      const dt = Math.min((now - last) / 1e3, 0.05), start = machine.cpu.getCycles();
+      try {
+        machine.run(Math.round(dt * CLOCK));
+        soundFrame(start, machine.cpu.getCycles());
+        draw();
+      } catch (e) {
+        pause();
+        note(e.message);
+      }
+    }
+    last = now;
+    requestAnimationFrame(frame);
+  }
+  $("start").onclick = play;
+  $("pause").onclick = () => running ? pause() : play();
+  $("new").onclick = () => {
+    prepare();
+    started = false;
+    play();
+    note("NEW GAME");
+  };
+  $("practice").onclick = () => {
+    const n = Number($("level").value);
+    if (!Number.isInteger(n) || n < 1 || n > 150) {
+      note("CHOOSE LEVEL 1\u2013150");
+      return;
+    }
+    prepare(n);
+    started = false;
+    play();
+    note("PRACTICE RUN");
+  };
+  $("display").onclick = () => {
+    mono = !mono;
+    $("display").textContent = mono ? "Green" : "Color";
+    draw();
+  };
+  $("sound").onclick = async () => {
+    if (!audio) audio = new AudioContext();
+    await audio.resume();
+    sound = !sound;
+    audioTime = 0;
+    $("sound").textContent = sound ? "Sound on" : "Sound off";
+    $("sound").setAttribute("aria-pressed", String(sound));
+  };
+  $("fullscreen").onclick = async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await $("screen").requestFullscreen();
+    } catch {
+      note("FULLSCREEN UNAVAILABLE");
+    }
+  };
+  $("help").onclick = () => {
+    pause();
+    $("instructions").showModal();
+  };
+  $("close-help").onclick = () => $("instructions").close();
+  function save() {
+    if (!started) {
+      note("START A GAME FIRST");
+      return;
+    }
+    note(storage.set("lr-save", JSON.stringify(machine.snapshot())) ? "GAME SAVED" : "STORAGE UNAVAILABLE \xB7 USE EXPORT");
+  }
+  $("save").onclick = save;
+  $("resume").onclick = () => {
+    try {
+      const s = storage.get("lr-save");
+      if (!s) {
+        note("NO SAVED GAME");
+        return;
+      }
+      machine.restore(JSON.parse(s));
+      started = true;
+      draw();
+      pause();
+      note("SAVE LOADED");
+    } catch {
+      note("COULD NOT LOAD SAVE");
+    }
+  };
+  $("export").onclick = () => {
+    const blob = new Blob([JSON.stringify(machine.snapshot())], { type: "application/json" }), a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "lode-runner-save.json";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1e3);
+    note("SAVE EXPORTED");
+  };
+  $("import").onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      if (file.size > 1e6) throw Error();
+      machine.restore(JSON.parse(await file.text()));
+      started = true;
+      draw();
+      pause();
+      note("SAVE IMPORTED");
+    } catch {
+      note("INVALID SAVE FILE");
+    }
+    e.target.value = "";
+  };
+  var keys = { ArrowLeft: "J", ArrowRight: "L", ArrowUp: "I", ArrowDown: "K", z: "U", x: "O", i: "I", j: "J", k: "K", l: "L", u: "U", o: "O", " ": " " };
+  document.addEventListener("keydown", (e) => {
+    if ($("instructions").open || ["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      if (started) running ? pause() : play();
+      return;
+    }
+    if (!running) return;
+    if (e.ctrlKey && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      machine.press(1);
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (machine.textEntry) {
+      const code = { Enter: 13, Backspace: 8, ArrowLeft: 8, ArrowRight: 21 }[e.key] ?? (e.key.length === 1 ? e.key.toUpperCase().charCodeAt(0) : null);
+      if (code !== null) {
+        e.preventDefault();
+        machine.press(code);
+      }
+      return;
+    }
+    const key = keys[e.key] || keys[e.key.toLowerCase()];
+    if (key) {
+      e.preventDefault();
+      machine.press(key.charCodeAt(0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      machine.press(13);
+    } else if (e.key.length === 1 && /[a-z]/i.test(e.key)) {
+      machine.press(e.key.toUpperCase().charCodeAt(0));
+    }
+  });
+  for (const b of document.querySelectorAll("[data-key]")) {
+    b.onpointerdown = (e) => {
+      e.preventDefault();
+      if (!running) return;
+      b.setPointerCapture(e.pointerId);
+      machine.press(b.dataset.key.charCodeAt(0));
+    };
+    b.onpointerup = () => machine.press(32);
+    b.onpointercancel = () => machine.press(32);
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) pause();
+  });
+  window.addEventListener("blur", () => {
+    if (running) pause();
+  });
+  prepare();
+  requestAnimationFrame(frame);
+  if (new URLSearchParams(location.search).has("qa")) {
+    machine.testLimit = 10;
+    window.lodeQA = { machine, prepare, play, pause, draw, status: () => machine.status() };
+  }
+})();

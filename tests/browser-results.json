@@ -1,0 +1,18 @@
+[
+  {
+    "browser": "Chrome",
+    "version": "155.0.8059.41",
+    "offline": true,
+    "levels": "1–10 only",
+    "checks": "Keyboard, pause, local save, export/import, invalid import, color, audio activation, help, mobile layout, original maps rendered; no browser errors or network requests",
+    "result": "pass"
+  },
+  {
+    "browser": "Edge",
+    "version": "155.0.4283.45",
+    "offline": true,
+    "levels": "1–10 only",
+    "checks": "Keyboard, pause, local save, export/import, invalid import, color, audio activation, help, mobile layout, original maps rendered; no browser errors or network requests",
+    "result": "pass"
+  }
+]

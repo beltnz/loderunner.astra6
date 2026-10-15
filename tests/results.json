@@ -1,0 +1,105 @@
+{
+  "scope": "Only original levels 1–10 and isolated mechanics fixtures based on level 1. No full solution walkthrough claimed.",
+  "results": [
+    {
+      "name": "Level 1: original map, live controls, guards, 45-second playability smoke",
+      "result": "pass"
+    },
+    {
+      "name": "Level 2: original map, live controls, guards, 45-second playability smoke",
+      "result": "pass"
+    },
+    {
+      "name": "Level 3: original map, live controls, guards, 45-second playability smoke",
+      "result": "pass"
+    },
+    {
+      "name": "Level 4: original map, live controls, guards, 45-second playability smoke",
+      "result": "pass"
+    },
+    {
+      "name": "Level 5: original map, live controls, guards, 45-second playability smoke",
+      "result": "pass"
+    },
+    {
+      "name": "Level 6: original map, live controls, guards, 45-second playability smoke",
+      "result": "pass"
+    },
+    {
+      "name": "Level 7: original map, live controls, guards, 45-second playability smoke",
+      "result": "pass"
+    },
+    {
+      "name": "Level 8: original map, live controls, guards, 45-second playability smoke",
+      "result": "pass"
+    },
+    {
+      "name": "Level 9: original map, live controls, guards, 45-second playability smoke",
+      "result": "pass"
+    },
+    {
+      "name": "Level 10: original map, live controls, guards, 45-second playability smoke",
+      "result": "pass"
+    },
+    {
+      "name": "Gold pickup awards 250 and cannot be collected twice",
+      "result": "pass"
+    },
+    {
+      "name": "Horizontal travel is blocked by stone",
+      "result": "pass"
+    },
+    {
+      "name": "Gravity, rope support, ladder climbing and trap doors",
+      "result": "pass"
+    },
+    {
+      "name": "Dig opens only eligible brick and starts a refill timer",
+      "result": "pass"
+    },
+    {
+      "name": "Occupied space above a brick prevents digging",
+      "result": "pass"
+    },
+    {
+      "name": "Refilling hole kills the player",
+      "result": "pass"
+    },
+    {
+      "name": "Buried guard receives resurrection timer and 75 points",
+      "result": "pass"
+    },
+    {
+      "name": "Guards fall into holes, award trap points, and climb out",
+      "result": "pass"
+    },
+    {
+      "name": "Guard gold pickup and drop preserve the outstanding gold count",
+      "result": "pass"
+    },
+    {
+      "name": "A guard falling onto the player kills the player",
+      "result": "pass"
+    },
+    {
+      "name": "Hidden ladders reveal after gold is exhausted",
+      "result": "pass"
+    },
+    {
+      "name": "Death resets the same level and consumes one life",
+      "result": "pass"
+    },
+    {
+      "name": "Level completion grants 1,500 points, one life, and advances 1 to 2",
+      "result": "pass"
+    },
+    {
+      "name": "Snapshot restores deterministic CPU and game state",
+      "result": "pass"
+    },
+    {
+      "name": "QA gate refuses level 11 before loading or running it",
+      "result": "pass"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.bin -text
+*.zip -text
+*.png -text
+research/main.asm -text -whitespace
+research/main.nw -text -whitespace
+research/track_*.asm -text -whitespace
+vendor/cpu6502-runtime/** -text -whitespace
